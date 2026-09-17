@@ -44,7 +44,7 @@ class ClientTests(unittest.TestCase):
         first = ManagedMailbox("one", object(), "one@bccto.cc", "one", "bccto.cc", time.monotonic() + 60)
         second = ManagedMailbox("two", object(), "two@bccto.cc", "two", "bccto.cc", time.monotonic() + 120)
         first.cursor = 99
-        first.status = "监听中"
+        first.status = "无新邮件"
         self.assertEqual(second.cursor, 0)
         self.assertEqual(second.status, "等待收件")
         self.assertGreaterEqual(second.remaining_seconds, first.remaining_seconds)

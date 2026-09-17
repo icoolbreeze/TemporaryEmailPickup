@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import requests
 import secrets
 import shutil
 import string
@@ -24,18 +25,45 @@ from urllib.parse import urlsplit
 
 from cf_browser import (
     CreativeFabricaBrowser,
+    MANUAL_BROWSER_NO_DEBUGGER_MESSAGE,
+    STUDIO_CDP_CAPTCHA_PENDING,
+    STUDIO_CDP_FAILED,
+    STUDIO_CDP_SUCCESS,
+    SYSTEM_BROWSER_PORT_REQUIRED_MESSAGE,
+    StudioCDPResult,
     browser_display_name,
     browser_was_closed,
     debugger_address_is_live,
     existing_debugger_address,
+    fetch_debugger_tabs,
+    find_system_browser_on_user_data,
+    is_human_verification_content,
+    launch_plain_chromium,
     manual_browser_command,
+    studio_login_via_cdp,
+)
+from chromium_profiles import (
+    ChromiumNamedProfile,
+    DEFAULT_USER_DATA_PATHS,
+    cf_pool_profiles,
+    discover_named_profiles,
+    get_user_data_dir_for_browser,
 )
 from donut_browser import (
     DEFAULT_DONUT_API_URL,
     DonutBrowserClient,
     DonutBrowserSession,
 )
-from outlook_client import OutlookClient, OutlookCredentials, OutlookError, parse_outlook_import
+from pickup_tunnel import ensure_pickup_tunnel, stop_pickup_tunnel
+from outlook_imap import received_at_sort_key
+from outlook_client import (
+    OutlookClient,
+    OutlookCredentials,
+    OutlookError,
+    OutlookPickupConfig,
+    parse_outlook_import,
+    set_default_pickup,
+)
 from rootsh_client import InboxUpdate, Mailbox, Message, RootshClient, html_to_text
 from secret_store import SecretStoreError, protect_secret, unprotect_secret
 from virtual_browser import (
@@ -61,6 +89,21 @@ LEGACY_BROWSER_SESSION_MODES = {
     "独立": ISOLATED_SESSION_MODE,
     "共享": REUSED_SESSION_MODE,
 }
+#: ``chromium_profile_mode`` values that decide which profile a Brave/Chrome
+#: browser launch opens. ``app`` keeps the old TemporaryEmailPickup blank
+#: profile; ``auto-cf`` is the LRU pool that hands out CF\* named profiles
+#: to isolated mailboxes; ``named`` pins every mailbox to the directory
+#: selected in the 「配置」 combobox; ``incognito`` (无痕模式) launches with
+#: ``--incognito`` on the same isolated TemporaryEmailPickup container so
+#: the window's cookies / local storage are ephemeral. It never opens a
+#: named profile and never touches the user's real User Data.
+CHROMIUM_PROFILE_MODES = ("app", "auto-cf", "named", "incognito")
+CHROMIUM_PROFILE_APP = "空白隔离配置"
+CHROMIUM_PROFILE_INCOGNITO = "无痕模式"
+CHROMIUM_PROFILE_AUTO_CF = "自动分配 CF 配置"
+CF_POOL_EXHAUSTED_MESSAGE = (
+    "请在 Brave 中再新建一个名为 CF4 的配置（或关闭一个已占用的 CF 窗口）"
+)
 
 
 def normalize_browser_session_mode(value: object) -> str:
@@ -89,6 +132,8 @@ class ManagedMailbox:
     donut_profile_id: str | None = None
     donut_debugger_address: str | None = None
     virtual_worker_id: str | None = None
+    chromium_profile_directory: str | None = None
+    imported_at: float | None = None
     messages: dict[str, Message] = field(default_factory=dict)
     status: str = "等待收件"
     busy: bool = False
@@ -114,6 +159,17 @@ class ManagedMailbox:
         return f"{minutes:02d}:{seconds:02d}"
 
 
+def format_imported_at(epoch: float | None) -> str:
+    if not isinstance(epoch, (int, float)) or isinstance(epoch, bool):
+        return "—"
+    if epoch <= 0:
+        return "—"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch))
+    except (OverflowError, OSError, ValueError, TypeError):
+        return "—"
+
+
 class TemporaryMailManagerApp:
     def __init__(self, root: tk.Tk, *, connect: bool = True) -> None:
         self.root = root
@@ -131,6 +187,12 @@ class TemporaryMailManagerApp:
         self.browser_drivers: dict[str, Any] = {}
         self.browser_workers: set[str] = set()
         self.browser_trackers: dict[str, threading.Thread] = {}
+        # Drivers attached by the manual-mode tracker; consumed by the
+        # open_browser worker so auto can reuse the live window the user
+        # already opened. Stays separate from ``browser_drivers`` because
+        # ``open_browser`` short-circuits to ``_refresh_existing_browser_points``
+        # whenever ``browser_drivers[key]`` exists, which would skip login.
+        self.tracker_drivers: dict[str, Any] = {}
         self.reused_registration_queue: deque[str] = deque()
         self.reused_registration_paused_key: str | None = None
         self.registration_outcomes: dict[str, str] = {}
@@ -170,6 +232,18 @@ class TemporaryMailManagerApp:
             self.settings["browser_session_mode"] = saved_session_mode
             self._write_settings()
         self.browser_session_mode_var = tk.StringVar(value=saved_session_mode)
+        # Chromium named-profile state. Resolved per-browser (Brave / Chrome)
+        # via discover_named_profiles() at startup, then re-discovered on
+        # demand by _refresh_chromium_profile_options. The 「配置」 combobox
+        # is only visible for Brave and Chrome; for Donut / VirtualBrowser
+        # the variables stay out of the way.
+        self.named_chromium_profiles: list[ChromiumNamedProfile] = []
+        self._chromium_profile_subframe: ttk.Frame | None = None
+        self._chromium_profile_combobox: ttk.Combobox | None = None
+        self._chromium_profile_label: ttk.Label | None = None
+        self._chromium_profile_widgets_visible = False
+        self.chromium_profile_var = tk.StringVar(value=CHROMIUM_PROFILE_APP)
+        self._restore_chromium_profile_settings()
         self.domain_var = tk.StringVar(value="bccto.cc")
         self.address_var = tk.StringVar(value="请选择或新建一个邮箱")
         self.detail_var = tk.StringVar(
@@ -186,6 +260,7 @@ class TemporaryMailManagerApp:
         self._configure_styles()
         self._build_ui()
         if connect:
+            self._setup_outlook_pickup()
             self._restore_mailboxes()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self._tick()
@@ -243,6 +318,27 @@ class TemporaryMailManagerApp:
         )
         self.browser_box.pack(side="left", padx=(0, 6))
         self.browser_box.bind("<<ComboboxSelected>>", self._browser_choice_changed)
+        # 「配置」 lives in its own subframe packed **immediately** after
+        # the browser combobox, before 「会话策略」, so it does not get
+        # pushed to the far right of the toolbar when it becomes visible.
+        self._chromium_profile_subframe = ttk.Frame(create_block)
+        self._chromium_profile_label = ttk.Label(
+            self._chromium_profile_subframe,
+            text="配置",
+            style="Subtitle.TLabel",
+        )
+        self._chromium_profile_label.pack(side="left", padx=(0, 5))
+        self._chromium_profile_combobox = ttk.Combobox(
+            self._chromium_profile_subframe,
+            textvariable=self.chromium_profile_var,
+            state="readonly",
+            width=18,
+        )
+        self._chromium_profile_combobox.pack(side="left")
+        self._chromium_profile_combobox.bind(
+            "<<ComboboxSelected>>", self._chromium_profile_changed
+        )
+        self._chromium_profile_subframe.pack(side="left", padx=(0, 6), after=self.browser_box)
         ttk.Label(create_block, text="会话策略", style="Subtitle.TLabel").pack(side="left", padx=(0, 5))
         self.browser_session_mode_box = ttk.Combobox(
             create_block,
@@ -283,8 +379,9 @@ class TemporaryMailManagerApp:
         ttk.Label(left_header, text="邮箱列表", style="Card.TLabel", font=("Microsoft YaHei UI", 12, "bold")).pack(side="left")
         ttk.Label(left_header, textvariable=self.summary_var, style="Card.TLabel", foreground=MUTED).pack(side="right")
 
-        self.mailbox_tree = ttk.Treeview(left, columns=("address", "remaining", "count", "points", "status", "background", "browser"), show="headings", selectmode="extended")
+        self.mailbox_tree = ttk.Treeview(left, columns=("address", "imported_at", "remaining", "count", "points", "status", "background", "browser"), show="headings", selectmode="extended")
         self.mailbox_tree.heading("address", text="邮箱地址")
+        self.mailbox_tree.heading("imported_at", text="导入时间")
         self.mailbox_tree.heading("remaining", text="剩余")
         self.mailbox_tree.heading("count", text="邮件")
         self.mailbox_tree.heading("points", text="积分")
@@ -292,6 +389,7 @@ class TemporaryMailManagerApp:
         self.mailbox_tree.heading("background", text="后台注册")
         self.mailbox_tree.heading("browser", text="浏览器打开")
         self.mailbox_tree.column("address", width=190, minwidth=140)
+        self.mailbox_tree.column("imported_at", width=128, minwidth=110, anchor="center")
         self.mailbox_tree.column("remaining", width=62, minwidth=55, anchor="center")
         self.mailbox_tree.column("count", width=50, minwidth=46, anchor="center")
         self.mailbox_tree.column("points", width=72, minwidth=60, anchor="center")
@@ -316,7 +414,12 @@ class TemporaryMailManagerApp:
         info_text.pack(side="left", fill="x", expand=True)
         ttk.Label(info_text, textvariable=self.address_var, style="Address.TLabel").pack(anchor="w")
         ttk.Label(info_text, textvariable=self.detail_var, style="Info.TLabel").pack(anchor="w", pady=(4, 0))
-        ttk.Label(info_row, text="仅在验证码阶段自动取件", style="Card.TLabel", foreground=MUTED).pack(side="right")
+        ttk.Label(
+            info_row,
+            text="平时需点「立即取件」；只有等验证码时才会自动拉信",
+            style="Card.TLabel",
+            foreground=MUTED,
+        ).pack(side="right")
 
         actions = ttk.Frame(detail_card, style="Card.TFrame")
         actions.pack(fill="x", pady=(15, 0))
@@ -398,7 +501,177 @@ class TemporaryMailManagerApp:
         ttk.Label(footer, text="●", foreground=SUCCESS).pack(side="left")
         ttk.Label(footer, textvariable=self.status_var, style="Subtitle.TLabel").pack(side="left", padx=(5, 0))
         ttk.Label(footer, text="可切换隔离会话或复用会话", style="Subtitle.TLabel").pack(side="right")
+        self._refresh_chromium_profile_options()
         self._update_action_states()
+
+    def _restore_chromium_profile_settings(self) -> None:
+        """Load ``chromium_profile_mode`` and the saved directory from disk.
+
+        Defaults: ``auto-cf`` when Brave is selected and CF* profiles
+        actually exist; ``app`` otherwise. Unknown modes silently fall back
+        to ``app`` so an old settings.json still loads. ``incognito`` is a
+        valid saved mode; like ``app`` it never keeps a
+        ``chromium_profile_directory``.
+        """
+        mode = str(self.settings.get("chromium_profile_mode", "")).strip()
+        if mode not in CHROMIUM_PROFILE_MODES:
+            mode = ""
+        if not mode:
+            cf_pool = cf_pool_profiles(discover_named_profiles())
+            if cf_pool:
+                mode = "auto-cf"
+            else:
+                mode = "app"
+        directory = str(self.settings.get("chromium_profile_directory", "") or "").strip()
+        if mode != "named":
+            directory = ""
+        if mode == "named" and not directory:
+            # A named mode without a concrete directory is meaningless;
+            # fall back to the auto-cf pool when possible.
+            cf_pool = cf_pool_profiles(discover_named_profiles())
+            mode = "auto-cf" if cf_pool else "app"
+        self.settings["chromium_profile_mode"] = mode
+        if mode == "named":
+            self.settings["chromium_profile_directory"] = directory
+        else:
+            self.settings.pop("chromium_profile_directory", None)
+        self._write_settings()
+        self._chromium_profile_mode = mode
+        self._chromium_profile_directory = directory
+        self.chromium_profile_var.set(self._chromium_profile_display_for_mode(mode, directory))
+
+    def _chromium_profile_display_for_mode(self, mode: str, directory: str) -> str:
+        """Return the combobox label that represents ``mode`` + ``directory``."""
+        if mode == "named" and directory:
+            profile = next(
+                (
+                    item
+                    for item in self.named_chromium_profiles
+                    if item.directory == directory
+                ),
+                None,
+            )
+            if profile is not None:
+                return profile.name
+        if mode == "auto-cf":
+            return CHROMIUM_PROFILE_AUTO_CF
+        if mode == "incognito":
+            return CHROMIUM_PROFILE_INCOGNITO
+        return CHROMIUM_PROFILE_APP
+
+    def _chromium_profile_options_for_browser(self, browser: str) -> list[str]:
+        """Return the combobox entries visible for the given browser."""
+        if browser not in {"Brave", "Chrome"}:
+            return []
+        profiles = [
+            profile
+            for profile in self.named_chromium_profiles
+            if profile.browser == browser
+        ]
+        ordered = [
+            CHROMIUM_PROFILE_APP,
+            CHROMIUM_PROFILE_INCOGNITO,
+            CHROMIUM_PROFILE_AUTO_CF,
+        ]
+        for profile in profiles:
+            if profile.name not in ordered:
+                ordered.append(profile.name)
+        return ordered
+
+    def _refresh_chromium_profile_options(self) -> None:
+        """Rebuild the combobox values from the current browser + Local State."""
+        if self._chromium_profile_combobox is None:
+            return
+        browser = self.browser_var.get()
+        if browser not in {"Brave", "Chrome"}:
+            self._hide_chromium_profile_widgets()
+            return
+        try:
+            self.named_chromium_profiles = discover_named_profiles()
+        except Exception:
+            self.named_chromium_profiles = []
+        values = self._chromium_profile_options_for_browser(browser)
+        self._chromium_profile_combobox.configure(values=tuple(values))
+        current = self.chromium_profile_var.get()
+        if current not in values:
+            current = (
+                self._chromium_profile_display_for_mode(
+                    self._chromium_profile_mode, self._chromium_profile_directory
+                )
+                if values
+                else CHROMIUM_PROFILE_APP
+            )
+            if current not in values and values:
+                current = values[0]
+            self.chromium_profile_var.set(current)
+        self._show_chromium_profile_widgets()
+
+    def _show_chromium_profile_widgets(self) -> None:
+        if self._chromium_profile_subframe is None:
+            return
+        if self._chromium_profile_widgets_visible:
+            return
+        self._chromium_profile_subframe.pack(
+            side="left", padx=(0, 6), after=self.browser_box
+        )
+        self._chromium_profile_widgets_visible = True
+
+    def _hide_chromium_profile_widgets(self) -> None:
+        if self._chromium_profile_subframe is None:
+            return
+        if not self._chromium_profile_widgets_visible:
+            return
+        self._chromium_profile_subframe.pack_forget()
+        self._chromium_profile_widgets_visible = False
+
+    def _chromium_profile_changed(self, _event: tk.Event[Any] | None = None) -> None:
+        """Persist the new 配置 selection and warn when live workers exist."""
+        selected = self.chromium_profile_var.get()
+        previous_display = self._chromium_profile_display_for_mode(
+            self._chromium_profile_mode, self._chromium_profile_directory
+        )
+        if selected == previous_display:
+            return
+        if (
+            self.browser_workers
+            or self.reused_registration_queue
+            or self.reused_registration_paused_key
+            or self._has_live_browser_drivers()
+            or any(process.poll() is None for process in self.manual_browser_processes.values())
+        ):
+            self.chromium_profile_var.set(previous_display)
+            messagebox.showwarning(
+                "无法切换配置",
+                "请先关闭本程序已打开的浏览器窗口，并等待注册队列结束后再切换。",
+                parent=self.root,
+            )
+            return
+        new_mode, new_directory = self._decode_chromium_profile_selection(selected)
+        self._chromium_profile_mode = new_mode
+        self._chromium_profile_directory = new_directory
+        self.settings["chromium_profile_mode"] = new_mode
+        if new_mode == "named":
+            self.settings["chromium_profile_directory"] = new_directory
+        else:
+            self.settings.pop("chromium_profile_directory", None)
+        if self._write_settings():
+            self.status_var.set(
+                f"已切换配置：{self._chromium_profile_display_for_mode(new_mode, new_directory)}"
+            )
+
+    def _decode_chromium_profile_selection(self, selected: str) -> tuple[str, str]:
+        """Map a combobox entry back to ``(mode, directory)``."""
+        if selected == CHROMIUM_PROFILE_APP:
+            return ("app", "")
+        if selected == CHROMIUM_PROFILE_INCOGNITO:
+            return ("incognito", "")
+        if selected == CHROMIUM_PROFILE_AUTO_CF:
+            return ("auto-cf", "")
+        for profile in self.named_chromium_profiles:
+            if profile.name == selected:
+                return ("named", profile.directory)
+        # Unknown selection: keep the current state.
+        return (self._chromium_profile_mode, self._chromium_profile_directory)
 
     def _load_settings(self) -> dict[str, Any]:
         try:
@@ -769,6 +1042,9 @@ class TemporaryMailManagerApp:
             self.browser_var.set(previous)
             return
         if selected == previous:
+            # Even when the user re-selects the same option, the
+            # 配置 combobox depends on which Chromium browser is active.
+            self._refresh_chromium_profile_options()
             return
         if (
             self.browser_workers
@@ -813,6 +1089,7 @@ class TemporaryMailManagerApp:
                 self.status_var.set(f"全局浏览器已切换为 {selected}")
         else:
             self.status_var.set(f"已选择 {selected}，但设置保存失败")
+        self._refresh_chromium_profile_options()
 
     def _browser_session_mode_changed(
         self, _event: tk.Event[Any] | None = None
@@ -941,6 +1218,8 @@ class TemporaryMailManagerApp:
                     "donut_profile_id": mailbox.donut_profile_id,
                     "donut_debugger_address": mailbox.donut_debugger_address,
                     "virtual_worker_id": mailbox.virtual_worker_id,
+                    "chromium_profile_directory": mailbox.chromium_profile_directory,
+                    "imported_at": mailbox.imported_at,
                     "messages": [
                         self._message_to_dict(message)
                         for message in mailbox.messages.values()
@@ -967,6 +1246,53 @@ class TemporaryMailManagerApp:
         except (OSError, TypeError, ValueError, SecretStoreError) as exc:
             if not self.closed:
                 self.status_var.set(f"邮箱数据保存失败：{exc}")
+
+    def _setup_outlook_pickup(self) -> None:
+        """Point OutlookClient at the VPS pickup service over an SSH tunnel.
+
+        Best effort: any failure only writes a status line so startup never
+        dies because the tunnel or the cloud service is unavailable.
+        """
+        base_url = (
+            os.environ.get("OUTLOOK_PICKUP_URL", "").strip()
+            or str(self.settings.get("outlook_pickup_url") or "").strip()
+            or "http://127.0.0.1:18793"
+        ).rstrip("/")
+        key = os.environ.get("OUTLOOK_PICKUP_KEY", "").strip()
+        if not key:
+            protected = str(self.settings.get("outlook_pickup_key") or "")
+            if protected:
+                try:
+                    key = unprotect_secret(protected).strip()
+                except SecretStoreError:
+                    key = ""
+        if not key:
+            key = secrets.token_urlsafe(32)
+            try:
+                self.settings["outlook_pickup_key"] = protect_secret(key)
+            except SecretStoreError as exc:
+                self.status_var.set(f"云端取件密钥保存失败：{exc}")
+                return
+            self._write_settings()
+        ssh_host = (
+            os.environ.get("OUTLOOK_PICKUP_SSH", "").strip()
+            or str(self.settings.get("outlook_pickup_ssh") or "").strip()
+            or "beike-server"
+        )
+        set_default_pickup(
+            OutlookPickupConfig(base_url, key, ssh_host=ssh_host)
+        )
+        try:
+            ensure_pickup_tunnel(ssh_host)
+            response = requests.get(f"{base_url}/health", timeout=3)
+            response.raise_for_status()
+            payload = response.json()
+            if not payload.get("ok"):
+                raise RuntimeError(f"/health 响应异常：{payload}")
+        except Exception as exc:
+            self.status_var.set(
+                f"云端取件隧道未就绪，取件时会自动重连：{exc}"
+            )
 
     def _restore_mailboxes(self) -> None:
         try:
@@ -1003,6 +1329,20 @@ class TemporaryMailManagerApp:
                     str(raw.get("donut_debugger_address") or "") or None
                 )
                 virtual_worker_id = str(raw.get("virtual_worker_id") or "") or None
+                chromium_profile_directory = (
+                    str(raw.get("chromium_profile_directory") or "") or None
+                )
+                imported_at: float | None = None
+                raw_imported_at = raw.get("imported_at")
+                if isinstance(raw_imported_at, (int, float)) and not isinstance(
+                    raw_imported_at, bool
+                ):
+                    try:
+                        candidate = float(raw_imported_at)
+                    except OverflowError:
+                        candidate = None
+                    if candidate is not None and candidate > 0:
+                        imported_at = candidate
                 if not key or not address or "@" not in address or key in self.mailboxes:
                     continue
                 if provider == "outlook":
@@ -1045,6 +1385,8 @@ class TemporaryMailManagerApp:
                     donut_profile_id=donut_profile_id,
                     donut_debugger_address=donut_debugger_address,
                     virtual_worker_id=virtual_worker_id,
+                    chromium_profile_directory=chromium_profile_directory,
+                    imported_at=imported_at,
                     messages=messages,
                     status=(
                         (
@@ -1237,6 +1579,7 @@ class TemporaryMailManagerApp:
             imported, failed = result
             self.import_outlook_button.configure(state="normal")
             first_key: str | None = None
+            imported_at = time.time()
             for client, update in imported:
                 credentials = client.credentials
                 key = uuid.uuid4().hex
@@ -1251,6 +1594,7 @@ class TemporaryMailManagerApp:
                     provider="outlook",
                     messages={message.message_id: message for message in update.messages},
                     status=f"Outlook {client.mode}",
+                    imported_at=imported_at,
                     next_poll_at=0.0,
                 )
                 self.mailboxes[key] = mailbox
@@ -1315,6 +1659,7 @@ class TemporaryMailManagerApp:
             local_part=local_part,
             domain=domain,
             expires_at=time.monotonic() + mailbox.lifetime_seconds,
+            imported_at=time.time(),
             next_poll_at=time.monotonic(),
         )
         self.mailboxes[key] = managed
@@ -1329,12 +1674,21 @@ class TemporaryMailManagerApp:
         if mailbox.notice:
             messagebox.showinfo("邮箱提示", mailbox.notice, parent=self.root)
 
-    def _mailbox_values(self, mailbox: ManagedMailbox) -> tuple[str, str, str, str, str, str, str]:
+    def _mailbox_values(self, mailbox: ManagedMailbox) -> tuple[str, str, str, str, str, str, str, str]:
         status = mailbox.status
         if mailbox.expired and not mailbox.busy:
             status = "已到期"
         points = f"{mailbox.points:,}" if mailbox.points is not None else "—"
-        return mailbox.address, mailbox.remaining_text, str(len(mailbox.messages)), points, status, "", ""
+        return (
+            mailbox.address,
+            format_imported_at(mailbox.imported_at),
+            mailbox.remaining_text,
+            str(len(mailbox.messages)),
+            points,
+            status,
+            "",
+            "",
+        )
 
     def _tick(self) -> None:
         self._reap_manual_browser_processes()
@@ -1507,9 +1861,9 @@ class TemporaryMailManagerApp:
             return
         self.mailbox_tree.selection_set(key)
         self._activate_mailbox(key)
-        if column == "#6":
+        if column == "#7":
             self.background_register(self.mailboxes[key])
-        elif column == "#7":
+        elif column == "#8":
             self.open_browser(self.mailboxes[key])
         else:
             self.refresh_mailbox(self.mailboxes[key], quiet=False)
@@ -1545,8 +1899,18 @@ class TemporaryMailManagerApp:
         if not mailbox:
             self._set_preview("从左侧选择一个邮箱，邮件会显示在这里。")
             return
-        for message in mailbox.messages.values():
-            self.message_tree.insert("", 0, iid=message.message_id, values=(message.sender, message.subject, message.size, message.received_at))
+        ordered = sorted(
+            mailbox.messages.values(),
+            key=lambda item: received_at_sort_key(item.received_at),
+            reverse=True,
+        )
+        for message in ordered:
+            self.message_tree.insert(
+                "",
+                "end",
+                iid=message.message_id,
+                values=(message.sender, message.subject, message.size, message.received_at),
+            )
         self._set_preview("双击邮件或点击“读取正文”查看内容。" if mailbox.messages else "当前邮箱还没有邮件。")
 
     def _update_action_states(self) -> None:
@@ -1629,6 +1993,34 @@ class TemporaryMailManagerApp:
         raise FileNotFoundError(f"未找到所选的 {selected}，请先安装或切换全局浏览器。")
 
     def _browser_profile_path(self, key: str, browser_path: Path) -> Path:
+        """Return the ``--user-data-dir`` to use for the given browser.
+
+        Four profile strategies coexist:
+
+        * ``app`` (空白隔离配置): keep the legacy blank TemporaryEmailPickup
+          profile under ``%LOCALAPPDATA%\\TemporaryEmailPickup\\...``.
+        * ``incognito`` (无痕模式): the same isolated TemporaryEmailPickup
+          container plus ``--incognito`` — never a named profile, never the
+          real User Data.
+        * ``auto-cf`` (自动分配 CF 配置): route through the user's real
+          Brave/Chrome User Data root, with ``--profile-directory`` picked
+          per mailbox by :meth:`_assign_chromium_profile_for_mailbox`.
+        * ``named``: every mailbox uses the user-selected directory.
+
+        The real User Data root is only returned for ``auto-cf`` /
+        ``named`` when :meth:`_chromium_profile_directory_for_mailbox`
+        actually produced a directory — the ``app`` mode always uses
+        the TemporaryEmailPickup blank profile so we never touch the
+        user's daily Brave/Chrome User Data.
+        """
+        if self._is_named_chromium_browser(browser_path):
+            mailbox = self.mailboxes.get(key)
+            if mailbox is not None:
+                directory = self._chromium_profile_directory_for_mailbox(mailbox)
+                if directory:
+                    user_data = self._chromium_user_data_for_browser(browser_path)
+                    if user_data is not None:
+                        return user_data
         if browser_display_name(browser_path) == "Chrome":
             root = self.browser_profile_root
         else:
@@ -1639,6 +2031,223 @@ class TemporaryMailManagerApp:
             ) or "chromium"
             root = self.app_data_root / f"browser_profiles_{slug}"
         return root / ("shared" if self._shared_browser_mode() else key)
+
+    def _chromium_profile_directory_for_mailbox(
+        self, mailbox: ManagedMailbox
+    ) -> str | None:
+        """Return the directory to use for a single mailbox, or None.
+
+        ``app`` and ``incognito`` return ``None`` (caller keeps the legacy
+        isolated profile; incognito never assigns a CF directory).
+        ``named`` returns the saved ``chromium_profile_directory``.
+        ``auto-cf`` + isolated: lazily assign a CF* directory via LRU
+        and persist it on the mailbox.
+        ``auto-cf`` + shared: use the first directory in the pool so the
+        whole queue reuses one named profile (matches the legacy shared
+        behaviour, just with CF clearance).
+        """
+        mode = self._chromium_profile_mode
+        if mode in ("app", "incognito"):
+            return None
+        if mode == "named":
+            directory = self._chromium_profile_directory
+            return directory or None
+        # auto-cf
+        if self._shared_browser_mode():
+            shared = self.settings.get("shared_chromium_profile_directory")
+            if shared:
+                return str(shared)
+            cf_pool = cf_pool_profiles(
+                [profile for profile in self.named_chromium_profiles]
+            )
+            if not cf_pool:
+                return None
+            shared = cf_pool[0].directory
+            self.settings["shared_chromium_profile_directory"] = shared
+            self._write_settings()
+            return shared
+        return self._assign_cf_profile(mailbox)
+
+    def _assign_cf_profile(self, mailbox: ManagedMailbox) -> str | None:
+        """Hand out an unused CF* directory to ``mailbox`` (LRU).
+
+        Raises ``RuntimeError`` with a Chinese message when the pool is
+        exhausted, per the assignment spec.
+        """
+        cf_pool = cf_pool_profiles(
+            [profile for profile in self.named_chromium_profiles]
+        )
+        if not cf_pool:
+            return None
+        if mailbox.chromium_profile_directory and any(
+            profile.directory == mailbox.chromium_profile_directory
+            for profile in cf_pool
+        ):
+            return mailbox.chromium_profile_directory
+        live_directories: set[str] = set()
+        for key, other in self.mailboxes.items():
+            if key == mailbox.key:
+                continue
+            if key in self.browser_workers and other.chromium_profile_directory:
+                live_directories.add(other.chromium_profile_directory)
+        for profile in cf_pool:
+            if profile.directory in live_directories:
+                continue
+            if profile.directory in {
+                other.chromium_profile_directory
+                for other in self.mailboxes.values()
+                if other.key != mailbox.key
+                and other.chromium_profile_directory
+            }:
+                continue
+            mailbox.chromium_profile_directory = profile.directory
+            return profile.directory
+        raise RuntimeError(CF_POOL_EXHAUSTED_MESSAGE)
+
+    def _is_named_chromium_browser(self, browser_path: Path | None) -> bool:
+        if browser_path is None:
+            return False
+        return browser_display_name(browser_path) in {"Brave", "Chrome"}
+
+    def _chromium_user_data_for_browser(self, browser_path: Path) -> Path | None:
+        return get_user_data_dir_for_browser(browser_display_name(browser_path))
+
+    def _system_browser_already_running(self, browser_path: Path) -> bool:
+        """Return True when a non-app Brave/Chrome owns the real User Data."""
+        if not self._is_named_chromium_browser(browser_path):
+            return False
+        user_data = self._chromium_user_data_for_browser(browser_path)
+        if user_data is None:
+            return False
+        try:
+            matches = find_system_browser_on_user_data(user_data)
+        except Exception:
+            return False
+        return bool(matches)
+
+    def _uses_incognito_launch(self) -> bool:
+        """Return True when the launch must append ``--incognito``.
+
+        Only Brave / Chrome get the switch: the 配置 combobox is hidden for
+        Donut / VirtualBrowser, so a leftover ``incognito`` settings value
+        must stay inert when the user switches the global browser away from
+        Chromium.
+        """
+        return (
+            self._chromium_profile_mode == "incognito"
+            and self.browser_var.get() in {"Brave", "Chrome"}
+        )
+
+    def _chromium_launch_arguments(
+        self,
+        mailbox: ManagedMailbox,
+        virtual_worker_id: str | None,
+    ) -> tuple[str, ...]:
+        """Build the ``launch_arguments`` tuple for ``CreativeFabricaBrowser``.
+
+        When the active browser is Brave/Chrome and the profile mode selects
+        a named directory, the ``--profile-directory=...`` switch is added
+        so the attach-after-subprocess path targets the same named profile
+        that ``manual_browser_command`` used. ``incognito`` mode adds
+        ``--incognito`` instead (it never selects a directory) so the
+        Selenium auto path launches the same ephemeral window the manual
+        path does.
+        """
+        args: list[str] = []
+        directory = self._chromium_profile_directory_for_mailbox(mailbox)
+        if directory:
+            args.append(f"--profile-directory={directory}")
+        if self._uses_incognito_launch():
+            args.append("--incognito")
+        if virtual_worker_id:
+            args.append(f"--worker-id={virtual_worker_id}")
+        return tuple(args)
+
+    def _uses_real_chromium_user_data(self, mailbox: ManagedMailbox) -> bool:
+        """Return True when the auto/background path must target real User Data.
+
+        True exactly when ``_browser_profile_path`` will hand the real
+        Brave/Chrome User Data root to the launcher. Auto/background
+        workers take a different attach-after-Popen route in that case
+        so the user's daily profile is not opened with
+        ``webdriver.Chrome(... --user-data-dir=...)``.
+        """
+        browser = self.browser_var.get()
+        if browser not in {"Brave", "Chrome"}:
+            return False
+        try:
+            browser_path = self._find_browser()
+        except (FileNotFoundError, OSError):
+            return False
+        if not self._is_named_chromium_browser(browser_path):
+            return False
+        directory = self._chromium_profile_directory_for_mailbox(mailbox)
+        if not directory:
+            return False
+        return self._chromium_user_data_for_browser(browser_path) is not None
+
+    def _ensure_named_chromium_debugger(
+        self,
+        mailbox: ManagedMailbox,
+        *,
+        timeout_seconds: float = 15.0,
+    ) -> tuple[Path, Path, str]:
+        """Return ``(browser_path, profile_path, debugger_address)`` for a named launch.
+
+        Implements the auto/background rules for the real Brave/Chrome
+        User Data:
+
+        1. If a debugger is already live on the profile directory, reuse
+           it (no relaunch, no WebDriver injection into the user's daily
+           browser).
+        2. Else, if a user-launched main brave/chrome process is running
+           without ``--remote-debugging-port``, raise
+           :data:`SYSTEM_BROWSER_PORT_REQUIRED_MESSAGE` so the user can
+           quit that window before the app attaches.
+        3. Else, ``subprocess.Popen`` the browser with
+           :func:`cf_browser.manual_browser_command` (which appends
+           ``--remote-debugging-port=0``) and poll
+           :func:`cf_browser.existing_debugger_address` until the
+           debugger is live, with a default 15-second timeout.
+
+        Never calls :func:`cf_browser.terminate_stale_profile_browser` —
+        that function now refuses any path that does not contain
+        ``TemporaryEmailPickup``, so killing the user's daily Brave is
+        impossible from this code path.
+        """
+        browser_path = self._find_browser()
+        if not self._is_named_chromium_browser(browser_path):
+            raise RuntimeError("仅 Brave / Chrome 走「CF」配置自动路径。")
+        profile_path = self._browser_profile_path(mailbox.key, browser_path)
+        existing = existing_debugger_address(profile_path)
+        if existing and debugger_address_is_live(existing):
+            return browser_path, profile_path, existing
+        if self._system_browser_already_running(browser_path):
+            raise RuntimeError(SYSTEM_BROWSER_PORT_REQUIRED_MESSAGE)
+        profile_directory = self._chromium_profile_directory_for_mailbox(mailbox)
+        command = manual_browser_command(
+            browser_path,
+            profile_path,
+            profile_directory=profile_directory,
+        )
+        try:
+            subprocess.Popen(command, cwd=str(browser_path.parent))
+        except OSError as exc:
+            raise RuntimeError(f"启动 {browser_path.name} 失败：{exc}") from exc
+        deadline = time.monotonic() + max(1.0, timeout_seconds)
+        address: str | None = None
+        while time.monotonic() < deadline:
+            candidate = existing_debugger_address(profile_path)
+            if candidate and debugger_address_is_live(candidate):
+                address = candidate
+                break
+            time.sleep(0.1)
+        if not address:
+            raise RuntimeError(
+                f"无法在 {int(timeout_seconds)} 秒内连接 {browser_path.name} 的调试端口；"
+                "请关闭窗口后再次点击“自动打开”。"
+            )
+        return browser_path, profile_path, address
 
     def _remember_donut_session(
         self,
@@ -1856,8 +2465,15 @@ class TemporaryMailManagerApp:
         if self._shared_browser_mode() and self.shared_browser_driver is not None:
             self.status_var.set("复用会话窗口已打开，后台注册队列将在窗口关闭后继续。")
             return
+        if self._uses_incognito_launch():
+            # 无痕后台注册同样必须是“普通用户窗口 + 原生 CDP”，任何
+            # ChromeDriver 附加都会让 Turnstile 在提交时判定为机器人。
+            self._start_incognito_cdp_background(mailbox)
+            return
         donut_client: DonutBrowserClient | None = None
         virtual_worker_id: str | None = None
+        named_debugger_address: str | None = None
+        ensure_named_debugger = False
         try:
             if self.browser_var.get() == "Donut":
                 browser_path = None
@@ -1873,8 +2489,26 @@ class TemporaryMailManagerApp:
                 browser_name = "VirtualBrowser"
             else:
                 browser_path = self._find_browser()
-                profile_path = self._browser_profile_path(mailbox.key, browser_path)
-                profile_path.mkdir(parents=True, exist_ok=True)
+                if self._uses_real_chromium_user_data(mailbox):
+                    # Attach-after-Popen so we never call webdriver.Chrome()
+                    # with --user-data-dir=<user's real User Data>; the
+                    # browser window is a normal Brave/Chrome window on
+                    # the named CF profile. The WMI probe + Popen +
+                    # DevToolsActivePort poll all happen in the worker
+                    # thread below so this click handler never blocks Tk.
+                    profile_path = None
+                    named_debugger_address = None
+                    ensure_named_debugger = True
+                else:
+                    # Isolated TemporaryEmailPickup profile: the daily
+                    # Brave/Chrome never shares its User Data lock, so no
+                    # WMI conflict check is needed.
+                    ensure_named_debugger = False
+                    profile_path = self._browser_profile_path(mailbox.key, browser_path)
+                    if self._chromium_profile_mode in ("app", "incognito"):
+                        # ``incognito`` shares the isolated TemporaryEmailPickup
+                        # container with ``app``, so it needs the same mkdir.
+                        profile_path.mkdir(parents=True, exist_ok=True)
                 browser_name = browser_display_name(browser_path)
             mail_client = mailbox.client.clone()
         except Exception as exc:
@@ -1917,10 +2551,16 @@ class TemporaryMailManagerApp:
             outcome["registered"] = True
 
         def worker() -> None:
+            nonlocal browser_path, profile_path, named_debugger_address
             automation: CreativeFabricaBrowser | None = None
             donut_session: DonutBrowserSession | None = None
             error: Exception | None = None
             try:
+                if ensure_named_debugger:
+                    # Slow WMI probe + Popen + 15s debugger poll: worker thread.
+                    browser_path, profile_path, named_debugger_address = (
+                        self._ensure_named_chromium_debugger(mailbox)
+                    )
                 self._renew_expired_mailbox_for_browser(mailbox, mail_client, status)
                 if donut_client is not None:
                     status(f"正在准备 {mailbox.address} 的 Donut 指纹配置…")
@@ -1966,7 +2606,11 @@ class TemporaryMailManagerApp:
                     )
                 automation = CreativeFabricaBrowser(
                     address=mailbox.address,
-                    profile_path=profile_path,
+                    profile_path=(
+                        profile_path
+                        if named_debugger_address is None
+                        else None
+                    ),
                     browser_path=browser_path,
                     mail_client=mail_client,
                     status=status,
@@ -1974,26 +2618,48 @@ class TemporaryMailManagerApp:
                     background=True,
                     authenticated=authenticated,
                     debugger_address=(
-                        donut_session.debugger_address if donut_session else None
+                        named_debugger_address
+                        or (
+                            donut_session.debugger_address if donut_session else None
+                        )
                     ),
                     browser_name=browser_name,
                     browser_version=(
                         donut_session.browser_version if donut_session else None
                     ),
                     launch_arguments=(
-                        (f"--worker-id={virtual_worker_id}",)
-                        if virtual_worker_id else ()
+                        ()
+                        if named_debugger_address is not None
+                        else self._chromium_launch_arguments(mailbox, virtual_worker_id)
                     ),
                     reset_site_session=(
-                        bool(virtual_worker_id) or self._shared_browser_mode()
+                        (
+                            False
+                            if named_debugger_address is not None
+                            else (
+                                bool(virtual_worker_id)
+                                or self._shared_browser_mode()
+                            )
+                        )
                     ),
-                    clear_site_data_on_logout=bool(virtual_worker_id),
+                    clear_site_data_on_logout=(
+                        False
+                        if named_debugger_address is not None
+                        else bool(virtual_worker_id)
+                    ),
                 )
                 automation.run()
             except Exception as exc:
                 error = exc
             finally:
-                if automation is not None and automation.driver is not None:
+                # When we attached to a real Brave/Chrome named profile, the
+                # window belongs to the user; calling ``driver.quit()`` would
+                # close it, so we have to leave the session alive.
+                if (
+                    automation is not None
+                    and automation.driver is not None
+                    and named_debugger_address is None
+                ):
                     try:
                         automation.driver.quit()
                     except Exception:
@@ -2116,6 +2782,220 @@ class TemporaryMailManagerApp:
         self._layout_browser_buttons()
         self._start_next_reused_registration()
 
+    def _prepare_incognito_cdp_launch(
+        self, mailbox: ManagedMailbox
+    ) -> tuple[Path, Path, str]:
+        """Resolve the plain-Chromium launch inputs for 无痕 自动打开.
+
+        Uses the isolated TemporaryEmailPickup profile (never real User
+        Data), so the daily-Brave WMI conflict check does not apply here;
+        refuses to start while a 手动打开 window without a debug port is
+        already up for this mailbox.
+        """
+        browser_path = self._find_browser()
+        profile_path = self._browser_profile_path(mailbox.key, browser_path)
+        profile_path.mkdir(parents=True, exist_ok=True)
+        manual = self.manual_browser_processes.get(mailbox.key)
+        if manual is not None and manual.poll() is None:
+            raise RuntimeError(MANUAL_BROWSER_NO_DEBUGGER_MESSAGE)
+        return browser_path, profile_path, browser_display_name(browser_path)
+
+    def _run_incognito_cdp_login(
+        self,
+        mailbox: ManagedMailbox,
+        browser_path: Path,
+        profile_path: Path,
+        status: Callable[[str], None],
+        *,
+        background: bool,
+    ) -> StudioCDPResult:
+        """Launch (or reuse) the plain window and run the raw-CDP Studio login."""
+        # Re-check the manual window on the worker thread: the user may have
+        # clicked 手动打开 between preparation and launch.
+        manual = self.manual_browser_processes.get(mailbox.key)
+        debugger_address = launch_plain_chromium(
+            browser_path,
+            profile_path,
+            manual_process=manual,
+        )
+        return studio_login_via_cdp(
+            debugger_address,
+            email=mailbox.address,
+            status=status,
+            background=background,
+            browser_name=browser_display_name(browser_path),
+        )
+
+    def _start_incognito_cdp_browser(self, mailbox: ManagedMailbox) -> None:
+        """Foreground 自动打开 for 无痕: plain window + raw CDP, no Selenium."""
+        try:
+            browser_path, profile_path, browser_name = (
+                self._prepare_incognito_cdp_launch(mailbox)
+            )
+        except Exception as exc:
+            self.status_var.set(f"浏览器启动失败：{exc}")
+            messagebox.showerror("无法打开浏览器", str(exc), parent=self.root)
+            return
+
+        mail_client = mailbox.client.clone()
+        self.browser_workers.add(mailbox.key)
+        mailbox.status = "浏览器启动中"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(mailbox.address)
+        self.status_var.set(
+            f"正在为 {mailbox.address} 启动{'复用会话' if self._shared_browser_mode() else '隔离会话'} {browser_name}；邮箱地址已复制"
+        )
+
+        def status(message: str) -> None:
+            self.root.after(0, lambda: self._browser_status(mailbox.key, message))
+
+        def points_updated(points: int) -> None:
+            self.root.after(
+                0, lambda: self._update_mailbox_points(mailbox.key, points)
+            )
+
+        def authenticated() -> None:
+            self.root.after(
+                0, lambda: self._mark_mailbox_registered(mailbox.key)
+            )
+
+        def worker() -> None:
+            error: Exception | None = None
+            try:
+                self._renew_expired_mailbox_for_browser(
+                    mailbox, mail_client, status
+                )
+                result = self._run_incognito_cdp_login(
+                    mailbox,
+                    browser_path,
+                    profile_path,
+                    status,
+                    background=False,
+                )
+                if result.status == STUDIO_CDP_SUCCESS:
+                    authenticated()
+                    if result.points is not None:
+                        points_updated(result.points)
+                    else:
+                        status(f"{mailbox.address} 已登录 Studio AI")
+                elif result.status == STUDIO_CDP_CAPTCHA_PENDING:
+                    # The window stays open; the next 自动打开 click reuses
+                    # the live debugger instead of launching a second window.
+                    status(
+                        f"CAPTCHA 人机验证仍在进行；请在 {browser_name} 窗口完成后"
+                        "再次点击“自动打开”"
+                    )
+                else:
+                    error = RuntimeError(result.detail or "Studio AI 登录失败")
+            except Exception as exc:
+                error = exc
+            finally:
+                mail_client.close()
+                self.root.after(
+                    0,
+                    lambda: self._finish_browser_worker(
+                        mailbox.key, None, error
+                    ),
+                )
+
+        threading.Thread(
+            target=worker,
+            name=f"creative-fabrica-incognito-{mailbox.key}",
+            daemon=True,
+        ).start()
+
+    def _start_incognito_cdp_background(self, mailbox: ManagedMailbox) -> None:
+        """Background register for 无痕: same CDP path, background outcomes."""
+        try:
+            browser_path, profile_path, browser_name = (
+                self._prepare_incognito_cdp_launch(mailbox)
+            )
+        except Exception as exc:
+            mailbox.status = "后台准备失败"
+            self.status_var.set(f"后台注册准备失败：{exc}")
+            self._record_registration_outcome(
+                mailbox,
+                "failed",
+                f"注册失败：{mailbox.address}（准备失败：{exc}）",
+            )
+            return
+
+        mail_client = mailbox.client.clone()
+        self.browser_workers.add(mailbox.key)
+        self.registration_outcomes[mailbox.key] = "running"
+        mailbox.status = "后台注册中"
+        self.status_var.set(f"正在后台登录/注册 {mailbox.address}…")
+        self._update_registration_feedback()
+        self._update_action_states()
+        self._layout_browser_buttons()
+        outcome: dict[str, Any] = {
+            "points": None,
+            "manual": False,
+            "registered": False,
+        }
+
+        def status(message: str) -> None:
+            if "检测到 CAPTCHA" in message or "需要 CAPTCHA" in message:
+                outcome["manual"] = True
+            self.root.after(
+                0,
+                lambda text=message: self._background_browser_status(
+                    mailbox.key, text
+                ),
+            )
+
+        def points_updated(points: int) -> None:
+            outcome["points"] = max(0, int(points))
+
+        def authenticated() -> None:
+            outcome["registered"] = True
+
+        def worker() -> None:
+            error: Exception | None = None
+            try:
+                self._renew_expired_mailbox_for_browser(
+                    mailbox, mail_client, status
+                )
+                result = self._run_incognito_cdp_login(
+                    mailbox,
+                    browser_path,
+                    profile_path,
+                    status,
+                    background=True,
+                )
+                if result.status == STUDIO_CDP_SUCCESS:
+                    authenticated()
+                    if result.points is not None:
+                        points_updated(result.points)
+                elif result.status == STUDIO_CDP_CAPTCHA_PENDING:
+                    outcome["manual"] = True
+                    status(
+                        f"Studio AI 登录需要 CAPTCHA，请在 {browser_name} 中完成；"
+                        "完成后请点击“自动打开”继续"
+                    )
+                else:
+                    error = RuntimeError(result.detail or "Studio AI 登录失败")
+            except Exception as exc:
+                error = exc
+            finally:
+                mail_client.close()
+                self.root.after(
+                    0,
+                    lambda: self._finish_background_register(
+                        mailbox.key,
+                        error,
+                        outcome["points"],
+                        outcome["manual"],
+                        outcome["registered"],
+                    ),
+                )
+
+        threading.Thread(
+            target=worker,
+            name=f"creative-fabrica-incognito-background-{mailbox.key}",
+            daemon=True,
+        ).start()
+
     def open_browser(self, mailbox: ManagedMailbox) -> None:
         if mailbox.key in self.browser_workers:
             self.status_var.set(f"{mailbox.address} 的浏览器登录/注册流程正在运行")
@@ -2137,6 +3017,13 @@ class TemporaryMailManagerApp:
             and not self.reused_registration_paused_key
         ):
             self.status_var.set("复用会话注册队列正在运行，请等待队列结束。")
+            return
+
+        if self._uses_incognito_launch():
+            # 无痕自动打开必须和手动打开一样是普通 Brave/Chrome 进程，只用
+            # 原生 CDP 填写 Studio 登录框：启动或附加 ChromeDriver 都会注入
+            # cdc_* / navigator.webdriver，Turnstile 提交必过人机验证。
+            self._start_incognito_cdp_browser(mailbox)
             return
 
         shared_driver = None
@@ -2171,6 +3058,8 @@ class TemporaryMailManagerApp:
 
         donut_client: DonutBrowserClient | None = None
         virtual_worker_id: str | None = None
+        named_debugger_address: str | None = None
+        ensure_named_debugger = False
         try:
             if shared_driver is not None:
                 browser_path = None
@@ -2190,8 +3079,27 @@ class TemporaryMailManagerApp:
                 browser_name = "VirtualBrowser"
             else:
                 browser_path = self._find_browser()
-                profile_path = self._browser_profile_path(mailbox.key, browser_path)
-                profile_path.mkdir(parents=True, exist_ok=True)
+                if self._uses_real_chromium_user_data(mailbox):
+                    # Attach-after-Popen so the user's daily Brave keeps
+                    # its cookies + Cloudflare clearance. The WMI probe,
+                    # Popen and 15s debugger poll all run on the worker
+                    # thread below, so this click handler never blocks Tk.
+                    # ``debugger_address`` into ``CreativeFabricaBrowser``
+                    # makes ``run()`` only attach, never relaunch with
+                    # ``--user-data-dir=<real User Data>``.
+                    profile_path = None
+                    named_debugger_address = None
+                    ensure_named_debugger = True
+                else:
+                    # Isolated TemporaryEmailPickup profile: the daily
+                    # Brave/Chrome User Data lock is irrelevant, so no WMI
+                    # conflict check is performed.
+                    ensure_named_debugger = False
+                    profile_path = self._browser_profile_path(mailbox.key, browser_path)
+                    if self._chromium_profile_mode in ("app", "incognito"):
+                        # ``incognito`` shares the isolated TemporaryEmailPickup
+                        # container with ``app``, so it needs the same mkdir.
+                        profile_path.mkdir(parents=True, exist_ok=True)
                 browser_name = browser_display_name(browser_path)
             mail_client = mailbox.client.clone()
         except Exception as exc:
@@ -2221,11 +3129,19 @@ class TemporaryMailManagerApp:
             self.root.after(0, lambda: self._mark_mailbox_registered(mailbox.key))
 
         def worker() -> None:
+            nonlocal browser_path, profile_path, named_debugger_address
             driver = None
             error: Exception | None = None
             automation: CreativeFabricaBrowser | None = None
             donut_session: DonutBrowserSession | None = None
             try:
+                if ensure_named_debugger:
+                    # Slow WMI probe + Popen + 15s debugger poll: worker thread.
+                    (
+                        browser_path,
+                        profile_path,
+                        named_debugger_address,
+                    ) = self._ensure_named_chromium_debugger(mailbox)
                 self._renew_expired_mailbox_for_browser(mailbox, mail_client, status)
                 if donut_client is not None:
                     status(f"正在准备 {mailbox.address} 的 Donut 指纹配置…")
@@ -2269,34 +3185,54 @@ class TemporaryMailManagerApp:
                             session.debugger_address,
                         ),
                     )
+                handed = self.tracker_drivers.pop(mailbox.key, None)
+                effective_driver = handed if handed is not None else shared_driver
                 automation = CreativeFabricaBrowser(
                     address=mailbox.address,
-                    profile_path=profile_path,
+                    profile_path=(
+                        profile_path
+                        if named_debugger_address is None
+                        else None
+                    ),
                     browser_path=browser_path,
                     mail_client=mail_client,
                     status=status,
                     points_updated=points_updated,
                     authenticated=authenticated,
                     debugger_address=(
-                        donut_session.debugger_address if donut_session else None
+                        named_debugger_address
+                        or (
+                            donut_session.debugger_address if donut_session else None
+                        )
                     ),
                     browser_name=browser_name,
                     browser_version=(
                         donut_session.browser_version if donut_session else None
                     ),
                     launch_arguments=(
-                        (f"--worker-id={virtual_worker_id}",)
-                        if virtual_worker_id else ()
+                        ()
+                        if named_debugger_address is not None
+                        else self._chromium_launch_arguments(mailbox, virtual_worker_id)
                     ),
                     reset_site_session=(
                         (
-                            bool(virtual_worker_id)
-                            and mailbox.status != "需要手动验证"
+                            False
+                            if named_debugger_address is not None
+                            else (
+                                (
+                                    bool(virtual_worker_id)
+                                    and mailbox.status != "需要手动验证"
+                                )
+                                or switching_shared_account
+                            )
                         )
-                        or switching_shared_account
                     ),
-                    clear_site_data_on_logout=bool(virtual_worker_id),
-                    driver=shared_driver,
+                    clear_site_data_on_logout=(
+                        False
+                        if named_debugger_address is not None
+                        else bool(virtual_worker_id)
+                    ),
+                    driver=effective_driver,
                 )
                 driver = automation.run()
             except Exception as exc:
@@ -2334,7 +3270,16 @@ class TemporaryMailManagerApp:
         ).start()
 
     def _open_manual_browser(self, mailbox: ManagedMailbox) -> None:
-        """Open a normal browser window without Selenium, input, or submission."""
+        """Open a normal browser window without Selenium, input, or submission.
+
+        The launch omits ``--remote-debugging-port`` so the window is a
+        plain user window: no DevTools listener, no ChromeDriver attach, no
+        ``navigator.webdriver`` / ``cdc_*`` — the only combination under
+        which Studio's invisible Turnstile lets the register modal pass.
+        No manual tracker is started (there is no debugger to observe);
+        window-close detection is handled by
+        :meth:`_reap_manual_browser_processes`.
+        """
         self._renew_expired_mailbox_for_browser(
             mailbox,
             None,
@@ -2363,16 +3308,32 @@ class TemporaryMailManagerApp:
                     if self._shared_browser_mode()
                     else self._acquire_virtual_worker(mailbox)
                 )
+                profile_directory: str | None = None
+                needs_running_check = False
             else:
                 browser_path = self._find_browser()
+                # The WMI conflict probe only applies to launches against the
+                # real Brave/Chrome User Data. Isolated app/incognito profiles
+                # live under TemporaryEmailPickup, so a daily Brave window is
+                # irrelevant and checking it would freeze Tk for seconds.
+                needs_running_check = self._uses_real_chromium_user_data(mailbox)
+                profile_directory = self._chromium_profile_directory_for_mailbox(mailbox)
                 profile_path = self._browser_profile_path(mailbox.key, browser_path)
-                profile_path.mkdir(parents=True, exist_ok=True)
+                if self._chromium_profile_mode == "app" or profile_directory is None:
+                    profile_path.mkdir(parents=True, exist_ok=True)
             command = manual_browser_command(
                 browser_path,
                 profile_path,
                 worker_id=virtual_worker_id,
+                profile_directory=profile_directory,
+                incognito=self._uses_incognito_launch(),
+                # 手动打开 must stay a plain user window: without the DevTools
+                # port nothing can attach ChromeDriver, so Studio's invisible
+                # Turnstile never sees ``navigator.webdriver`` / ``cdc_*``.
+                # The VirtualBrowser worker-id path never exposed a port, so
+                # this flag changes nothing there.
+                remote_debugging=False,
             )
-            process = subprocess.Popen(command, cwd=str(browser_path.parent))
         except (OSError, RuntimeError, VirtualBrowserError) as exc:
             if virtual_worker_id:
                 self._release_virtual_worker(mailbox.key)
@@ -2381,17 +3342,67 @@ class TemporaryMailManagerApp:
             messagebox.showerror("无法打开手动浏览器", detail, parent=self.root)
             return
 
-        self.manual_browser_processes[mailbox.key] = process
-        self.root.clipboard_clear()
-        self.root.clipboard_append(mailbox.address)
-        mailbox.status = "等待手动操作"
-        if not virtual_worker_id:
-            self._start_manual_browser_tracker(mailbox, profile_path, process)
+        def launch_manual_process() -> None:
+            # Popen is cheap and may run directly on the Tk thread; the named
+            # path reaches it through root.after after the WMI guard finishes.
+            try:
+                process = subprocess.Popen(command, cwd=str(browser_path.parent))
+            except OSError as exc:
+                if virtual_worker_id:
+                    self._release_virtual_worker(mailbox.key)
+                detail = f"启动 {browser_path.name} 失败：{exc}"
+                self.status_var.set(f"手动浏览器启动失败：{detail}")
+                messagebox.showerror("无法打开手动浏览器", detail, parent=self.root)
+                return
+            self.manual_browser_processes[mailbox.key] = process
+            self.root.clipboard_clear()
+            self.root.clipboard_append(mailbox.address)
+            mailbox.status = "等待手动操作"
+            # No manual tracker: the launch above has no DevTools port, so
+            # there is nothing to observe and attaching would break Turnstile.
+            # Window close is detected by _reap_manual_browser_processes on
+            # the UI tick.
+            self.status_var.set(
+                f"已打开 {mailbox.address} 的 Studio AI，邮箱已复制；请自行登录、注册和完成验证。"
+            )
+            self._update_active_header()
+            self._layout_browser_buttons()
+
+        if not needs_running_check:
+            # Isolated 手动打开 stays a single fast Popen on the Tk thread.
+            launch_manual_process()
+            return
+
+        def running_browser_guard() -> None:
+            # Named CF profile: run the (possibly slow) WMI probe off the Tk
+            # thread; marshal the error dialog or the Popen back via root.after.
+            try:
+                conflict = self._system_browser_already_running(browser_path)
+            except Exception:
+                conflict = False
+            if conflict:
+                self.root.after(
+                    0, lambda: self._report_manual_browser_conflict(mailbox.key)
+                )
+                return
+            self.root.after(0, launch_manual_process)
+
         self.status_var.set(
-            f"已打开 {mailbox.address} 的网站首页，邮箱已复制；请自行登录、注册和完成验证。"
+            f"正在为 {mailbox.address} 准备 {browser_display_name(browser_path)}…"
         )
-        self._update_active_header()
-        self._layout_browser_buttons()
+        threading.Thread(
+            target=running_browser_guard,
+            name=f"manual-browser-guard-{mailbox.key}",
+            daemon=True,
+        ).start()
+
+    def _report_manual_browser_conflict(self, key: str) -> None:
+        """Surface the daily-Brave conflict error from the manual guard thread."""
+        if self.closed:
+            return
+        detail = SYSTEM_BROWSER_PORT_REQUIRED_MESSAGE
+        self.status_var.set(f"手动浏览器启动失败：{detail}")
+        messagebox.showerror("无法打开手动浏览器", detail, parent=self.root)
 
     def _reap_manual_browser_processes(self) -> None:
         for key, process in list(self.manual_browser_processes.items()):
@@ -2432,6 +3443,61 @@ class TemporaryMailManagerApp:
         if "/login" in lowered or "/signup" in lowered:
             return False
         return None
+
+    @staticmethod
+    def _tracker_next_action(
+        *,
+        auto_running: bool,
+        offered: bool,
+        has_local_driver: bool,
+        has_browser_driver: bool,
+        allow_attach: bool = True,
+    ) -> str:
+        """Decide what the manual-mode tracker should do with its driver slot.
+
+        The tracker polls a few times a second. This helper isolates the
+        driver-handoff policy from the live-browser / CF blocking checks so
+        the rules can be unit-tested without a real Chrome.
+
+        Returns one of:
+
+        - ``"publish"``: auto/background has the wheel; publish the local
+          driver into ``tracker_drivers`` (only if not already offered).
+        - ``"skip"``: auto still owns the session; just wait.
+        - ``"observe_local"``: keep using the already-attached local driver.
+        - ``"observe_existing"``: auto is done and left a driver in
+          ``browser_drivers[key]``; observe with that one instead of
+          attaching a second ChromeDriver.
+        - ``"attach"``: no handed or auto driver exists; safe to attach a
+          fresh tracker driver (only returned when ``allow_attach`` is
+          True).
+        - ``"wait_json"``: the ``"attach"`` state, but attaching is
+          forbidden for this tracker; the caller should just poll the
+          DevTools ``/json`` tab list (or sleep) and never start
+          ChromeDriver.
+        - ``"exit"``: the tracker already handed a driver to auto and the
+          window is no longer observable; stop the loop.
+
+        ``allow_attach=False`` only changes the would-be ``"attach"``
+        result into ``"wait_json"``; every other branch is unchanged. The
+        manual tracker always passes False: Studio's invisible Turnstile on
+        the login/register modal fails the human check as soon as
+        ChromeDriver's ``cdc_*`` globals are present, even on an otherwise
+        site-ready page.
+        """
+        if auto_running:
+            if has_local_driver and not offered:
+                return "publish"
+            return "skip"
+        if has_local_driver:
+            return "observe_local"
+        if has_browser_driver:
+            return "observe_existing"
+        if offered:
+            return "exit"
+        if not allow_attach:
+            return "wait_json"
+        return "attach"
 
     def _observe_site_login(self, key: str, state: bool) -> None:
         if state is not True:
@@ -2513,44 +3579,138 @@ class TemporaryMailManagerApp:
         profile_path: Path,
         process: subprocess.Popen[Any],
     ) -> None:
-        """Observe a manually opened window: URL, login state and Studio points."""
+        """Observe a manually opened window: URL, login state and Studio points.
+
+        The tracker must never attach ChromeDriver to this window. Studio's
+        invisible Turnstile on the login/register modal is **not** a
+        Cloudflare "Just a moment" interstitial, so the old "wait until
+        site-ready then attach" policy still injects ChromeDriver's
+        ``cdc_*`` scripts into the very widget the user is about to submit,
+        and Studio answers with "We could not verify that you are human.
+        Please try again." Manual launches (``_open_manual_browser``) also
+        start without ``--remote-debugging-port``, so there is normally no
+        debugger to poll at all — window close is detected by
+        ``_reap_manual_browser_processes`` instead. Auto/background flows
+        get priority: once ``key in self.browser_workers``, the tracker
+        hands off its driver (if any) and stops attaching.
+
+        Driver handoff is guarded by an ``offered`` flag so the tracker
+        publishes the same driver into ``tracker_drivers`` at most once, and
+        the post-auto path always observes with the driver auto left in
+        ``browser_drivers`` instead of attaching a second ChromeDriver.
+        """
         key = mailbox.key
         if key in self.browser_trackers:
             return
 
         def track() -> None:
             driver = None
+            offered = False
+            # Stays False: this tracker no longer attaches ChromeDriver, so
+            # every driver it sees was created elsewhere (auto or a handed
+            # off session) and must never be quit here.
+            tracker_owned = False
             automation: CreativeFabricaBrowser | None = None
+            By: Any = None
             try:
                 while not self.closed and key in self.mailboxes and process.poll() is None:
-                    if key in self.browser_workers:
+                    debugger_address = existing_debugger_address(profile_path)
+                    if not debugger_address or not debugger_address_is_live(
+                        debugger_address
+                    ):
+                        time.sleep(1)
+                        continue
+
+                    action = self._tracker_next_action(
+                        auto_running=key in self.browser_workers,
+                        offered=offered,
+                        has_local_driver=driver is not None,
+                        has_browser_driver=self.browser_drivers.get(key) is not None,
+                        # Manual windows must stay free of ChromeDriver: the
+                        # helper may never answer "attach" for this tracker.
+                        allow_attach=False,
+                    )
+
+                    if action == "publish":
+                        # Auto/background has the wheel. Hand off our driver
+                        # so open_browser can reuse it, and stay out of the
+                        # way of any competing ChromeDriver. ``offered`` is
+                        # the single source of truth for "already published
+                        # this driver" so we never re-publish even if the
+                        # caller forgets to clear ``driver``.
+                        self.tracker_drivers[key] = driver
+                        offered = True
+                        tracker_owned = False
+                        driver = None
                         time.sleep(2)
                         continue
-                    if driver is None:
-                        debugger_address = existing_debugger_address(profile_path)
-                        if not debugger_address or not debugger_address_is_live(
-                            debugger_address
-                        ):
-                            time.sleep(1)
-                            continue
-                        automation = self._make_tracking_automation(mailbox)
-                        automation.debugger_address = debugger_address
-                        try:
-                            webdriver, By, _WebDriverWait = automation._selenium_imports()
-                            driver = automation._attach_to_debugger(webdriver)
-                        except Exception:
-                            driver = None
-                            time.sleep(2)
-                            continue
+                    if action == "skip":
+                        time.sleep(2)
+                        continue
+                    if action == "exit":
+                        break
+
+                    if action in ("attach", "wait_json"):
+                        # Never start ChromeDriver for a manual window. The
+                        # manual launch has no debugger to attach to, and
+                        # even when one appears, Studio's invisible Turnstile
+                        # is not a Cloudflare "Just a moment" interstitial: a
+                        # site-ready page still fails the human check once
+                        # ``cdc_*`` is injected into it. Sleep and keep
+                        # polling /json titles instead — but never attach.
+                        time.sleep(2)
+                        continue
+                    # Remaining actions: observe_local / observe_existing —
+                    # both reuse a driver that already exists.
+                    port_text = debugger_address.rsplit(":", 1)[-1]
+                    try:
+                        port = int(port_text)
+                    except ValueError:
+                        port = 0
+                    tabs = fetch_debugger_tabs(port) if port else []
+                    blocking = any(
+                        is_human_verification_content(
+                            tab.get("url", ""),
+                            tab.get("title", ""),
+                            "",
+                        )
+                        for tab in tabs
+                    )
+                    if blocking:
+                        time.sleep(1)
+                        continue
+
+                    if action == "observe_existing":
+                        # Auto finished and left a driver here; observe with
+                        # that one instead of attaching a second ChromeDriver
+                        # to the same debugger.
+                        driver = self.browser_drivers[key]
+                        tracker_owned = False
+                        if automation is None:
+                            automation = self._make_tracking_automation(mailbox)
+                        if By is None:
+                            try:
+                                _webdriver, By, _WebDriverWait = automation._selenium_imports()
+                            except Exception:
+                                time.sleep(2)
+                                continue
+                    # action == "observe_local": driver is already set, By is too.
+
                     if not self._track_observation_round(
                         mailbox, automation, driver, By
                     ):
                         break
                     time.sleep(3)
             finally:
-                # Only quit the attached session once the user's window is gone;
-                # quitting an attached driver must never close the live window.
-                if driver is not None and process.poll() is not None:
+                # Only quit a driver the tracker actually owns, and only
+                # once the OS process is dead. Quitting a driver that was
+                # handed to auto or borrowed from ``browser_drivers`` would
+                # close the live window the user is still on.
+                if (
+                    driver is not None
+                    and process.poll() is not None
+                    and tracker_owned
+                ):
                     try:
                         driver.quit()
                     except Exception:
@@ -2881,6 +4041,11 @@ class TemporaryMailManagerApp:
         if mailbox:
             self.refresh_mailbox(mailbox, quiet=False)
 
+    @staticmethod
+    def _idle_mail_status(mailbox: ManagedMailbox) -> str:
+        """Status after a finished mailbox action that is not a live watch."""
+        return "收件箱空" if not mailbox.messages else "无新邮件"
+
     def refresh_mailbox(self, mailbox: ManagedMailbox, *, quiet: bool) -> None:
         if mailbox.busy or mailbox.key not in self.mailboxes:
             return
@@ -2906,9 +4071,9 @@ class TemporaryMailManagerApp:
                     mailbox.messages[message.message_id] = message
                     added += 1
             mailbox.busy = False
-            mailbox.status = f"新增 {added} 封" if added else "监听中"
+            mailbox.status = f"新增 {added} 封" if added else self._idle_mail_status(mailbox)
             mailbox.next_poll_at = 0.0
-            if self.active_key == mailbox.key and added:
+            if self.active_key == mailbox.key:
                 self._render_active_messages()
             self._update_action_states()
             if added:
@@ -3042,7 +4207,7 @@ class TemporaryMailManagerApp:
 
         def success(source: str) -> None:
             mailbox.busy = False
-            mailbox.status = "监听中"
+            mailbox.status = self._idle_mail_status(mailbox)
             heading = ""
             if message:
                 heading = f"邮箱：{mailbox.address}\n发件人：{message.sender}\n主题：{message.subject}\n时间：{message.received_at}\n{'─' * 58}\n\n"
@@ -3092,7 +4257,7 @@ class TemporaryMailManagerApp:
 
     def _finish_file_operation(self, mailbox: ManagedMailbox, status: str) -> None:
         mailbox.busy = False
-        mailbox.status = "监听中"
+        mailbox.status = self._idle_mail_status(mailbox)
         self._update_action_states()
         self.status_var.set(status)
 
@@ -3111,7 +4276,7 @@ class TemporaryMailManagerApp:
             for message_id in deleted:
                 mailbox.messages.pop(message_id, None)
             mailbox.busy = False
-            mailbox.status = "监听中"
+            mailbox.status = self._idle_mail_status(mailbox)
             self._render_active_messages()
             self._update_action_states()
             self.status_var.set(f"已从 {mailbox.address} 删除 {len(deleted)} 封邮件")
@@ -3150,6 +4315,7 @@ class TemporaryMailManagerApp:
         for mailbox in self.mailboxes.values():
             mailbox.client.close()
         self.executor.shutdown(wait=False, cancel_futures=True)
+        stop_pickup_tunnel()
         self.root.destroy()
 
 
@@ -3171,6 +4337,7 @@ def smoke_test() -> None:
     app.browser_session_mode_var.set(REUSED_SESSION_MODE)
     app._browser_session_mode_changed()
     assert app._browser_profile_path("smoke-one", Path("chrome.exe")).name == "shared"
+    smoke_imported_at = 1_700_000_000.0
     for key in ("smoke-one", "smoke-two"):
         mailbox = ManagedMailbox(
             key=key,
@@ -3180,6 +4347,7 @@ def smoke_test() -> None:
             domain="bccto.cc",
             expires_at=time.monotonic() + 600,
             points=5000 if key == "smoke-one" else 1250,
+            imported_at=smoke_imported_at if key == "smoke-one" else None,
         )
         app.mailboxes[key] = mailbox
         app.mailbox_tree.insert("", "end", iid=key, values=app._mailbox_values(mailbox))
@@ -3217,6 +4385,7 @@ def smoke_test() -> None:
     app._save_split_state()
     root.update_idletasks()
     assert str(app.mailbox_tree.cget("selectmode")) == "extended"
+    assert "imported_at" in app.mailbox_tree.cget("columns")
     assert len(app.mailbox_tree.selection()) == 2
     assert len(app.mailbox_browser_buttons) == 3
     assert {
@@ -3246,6 +4415,9 @@ def smoke_test() -> None:
     assert len(persisted["mailboxes"]) == 3
     assert persisted["mailboxes"][0]["address"].endswith("@bccto.cc")
     assert persisted["mailboxes"][0]["points"] == 5000
+    assert persisted["mailboxes"][0]["imported_at"] == smoke_imported_at
+    smoke_two_row = next(item for item in persisted["mailboxes"] if item["address"] == "smoke-two@bccto.cc")
+    assert smoke_two_row["imported_at"] is None
     outlook_row = next(item for item in persisted["mailboxes"] if item["provider"] == "outlook")
     assert "smoke-password" not in outlook_row["outlook_secret"]
     assert "smoke-refresh-token" not in outlook_row["outlook_secret"]
@@ -3263,6 +4435,8 @@ def smoke_test() -> None:
     assert len(restored_app.mailbox_background_buttons) == 3
     assert restored_app.active_key in restored_app.mailboxes
     assert restored_app.mailboxes["smoke-one"].points == 5000
+    assert restored_app.mailboxes["smoke-one"].imported_at == smoke_imported_at
+    assert restored_app.mailboxes["smoke-two"].imported_at is None
     assert restored_app.mailboxes["smoke-outlook"].provider == "outlook"
     assert restored_app.mailboxes["smoke-outlook"].client.credentials.refresh_token == "smoke-refresh-token"
     restored_app.close()
@@ -3280,6 +4454,18 @@ def main() -> None:
     root = tk.Tk()
     TemporaryMailManagerApp(root)
     root.mainloop()
+
+
+def _chromium_assign_cf_profile_for_tests(
+    app: "TemporaryMailManagerApp",
+    mailbox: "ManagedMailbox",
+) -> str | None:
+    """Test-only wrapper around :meth:`TemporaryMailManagerApp._assign_cf_profile`.
+
+    Module-level so the helper tests can pass in a stub ``app`` without
+    having to spin up the full Tkinter UI.
+    """
+    return app._assign_cf_profile(mailbox)
 
 
 if __name__ == "__main__":

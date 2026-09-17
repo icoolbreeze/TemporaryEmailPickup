@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import html
+import json
 import re
 import os
 import socket
 import subprocess
 import time
+import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.error import URLError
 
+from cdp_client import CDPClient, CDPError, find_page_target
 from rootsh_client import html_to_text
 
 
@@ -25,6 +31,8 @@ HUMAN_VERIFICATION_TIMEOUT_SECONDS = 600
 PAGE_PROBE_RETRY_SECONDS = 8
 NAVIGATION_CHALLENGE_GRACE_SECONDS = 5
 LOGOUT_WAIT_SECONDS = 10
+LOGIN_FORM_SELECTOR = "main form.woocommerce-form-login"
+REGISTER_FORM_SELECTOR = "main form.woocommerce-form-register"
 
 StatusCallback = Callable[[str], None]
 PointsCallback = Callable[[int], None]
@@ -48,8 +56,29 @@ def manual_browser_command(
     profile_path: Path,
     *,
     worker_id: str | None = None,
+    profile_directory: str | None = None,
+    incognito: bool = False,
+    remote_debugging: bool = True,
 ) -> list[str]:
-    """Build a normal Chromium launch command with no WebDriver involvement."""
+    """Build a normal Chromium launch command with no WebDriver involvement.
+
+    When ``profile_directory`` is provided (e.g. ``"Profile 4"`` for a named
+    Brave/Chrome profile), ``--profile-directory=...`` is appended so the
+    browser skips the "Who's using …?" profile picker and opens the
+    selected profile directly.
+
+    When ``incognito`` is True, ``--incognito`` is appended so the window's
+    cookies / local storage stay ephemeral. ``--user-data-dir`` still points
+    at the isolated TemporaryEmailPickup container so the profile never
+    touches the user's daily browser data.
+
+    With ``remote_debugging=False`` (the 手动打开 path) the command omits
+    ``--remote-debugging-port=0``: the window stays a plain user window
+    with no DevTools listener, so ChromeDriver can never attach and
+    ``navigator.webdriver`` / ``cdc_*`` never appear — Studio's invisible
+    Turnstile then passes the human check. Ignored when ``worker_id`` is
+    set; the VirtualBrowser path never exposed a debug port anyway.
+    """
     command = [
         str(browser_path),
         f"--user-data-dir={profile_path}",
@@ -57,13 +86,23 @@ def manual_browser_command(
         "--no-default-browser-check",
         "--new-window",
     ]
+    if incognito:
+        command.append("--incognito")
+    if profile_directory:
+        command.append(f"--profile-directory={profile_directory}")
     if worker_id:
         command.append(f"--worker-id={worker_id}")
-    else:
+    elif remote_debugging:
         # Expose the local DevTools port so the app can attach read-only and
-        # track the window's URL, login state and Studio points.
+        # track the window's URL, login state and Studio points. 手动打开
+        # passes ``remote_debugging=False`` instead: a DevTools listener is
+        # what lets ChromeDriver attach and flip the automation signals the
+        # Turnstile widget reacts to.
         command.append("--remote-debugging-port=0")
-    command.append(HOME_URL)
+    # Open Studio directly: the main ``www.creativefabrica.com`` site
+    # is protected by Cloudflare's "Just a moment…" interstitial, while
+    # ``studio.creativefabrica.com`` is reachable without a challenge.
+    command.append(STUDIO_URL)
     return command
 
 
@@ -91,6 +130,60 @@ def debugger_address_is_live(address: str, *, timeout: float = 0.5) -> bool:
         return False
 
 
+MANUAL_BROWSER_NO_DEBUGGER_MESSAGE = (
+    "该邮箱的手动浏览器窗口已经打开，但手动窗口没有调试端口，"
+    "程序无法在不触发人机验证的情况下接入。请先关闭该手动窗口，"
+    "再点击“自动打开”。"
+)
+
+
+def launch_plain_chromium(
+    browser_path: Path,
+    profile_path: Path,
+    *,
+    timeout_seconds: float = 15.0,
+    manual_process: subprocess.Popen[Any] | None = None,
+) -> str:
+    """Launch a plain user Chromium for incognito 自动打开 and return its CDP address.
+
+    The command is the 手动打开 command (``--incognito`` on the isolated
+    TemporaryEmailPickup container) plus ``--remote-debugging-port=0``: the
+    process has no ChromeDriver, no ``--enable-automation`` and no ``cdc_*``
+    globals. The returned address is for the raw CDP WebSocket only; it must
+    never be passed into ``CreativeFabricaBrowser`` / ``webdriver.Chrome``.
+
+    A live ``DevToolsActivePort`` is reused (second 自动打开 click CDPs into
+    the existing window instead of taking the profile lock a second time).
+    A still-running 手动打开 window has no debugger and can never be attached
+    to, so the caller is asked to close it first.
+    """
+    existing = existing_debugger_address(profile_path)
+    if existing and debugger_address_is_live(existing):
+        return existing
+    if manual_process is not None and manual_process.poll() is None:
+        raise RuntimeError(MANUAL_BROWSER_NO_DEBUGGER_MESSAGE)
+    command = manual_browser_command(
+        browser_path,
+        profile_path,
+        incognito=True,
+        remote_debugging=True,
+    )
+    try:
+        subprocess.Popen(command, cwd=str(browser_path.parent))
+    except OSError as exc:
+        raise RuntimeError(f"启动 {browser_path.name} 失败：{exc}") from exc
+    deadline = time.monotonic() + max(1.0, timeout_seconds)
+    while time.monotonic() < deadline:
+        candidate = existing_debugger_address(profile_path)
+        if candidate and debugger_address_is_live(candidate):
+            return candidate
+        time.sleep(0.1)
+    raise RuntimeError(
+        f"无法在 {int(timeout_seconds)} 秒内连接 {browser_path.name} 的调试端口；"
+        "请关闭窗口后再次点击“自动打开”。"
+    )
+
+
 def browser_was_closed(error: BaseException) -> bool:
     """Recognize Selenium errors caused by the user closing the Chrome window."""
     detail = " ".join(
@@ -113,14 +206,31 @@ def browser_was_closed(error: BaseException) -> bool:
 
 
 def is_human_verification_content(
-    url: str, title: str, body_text: str, *, has_challenge_frame: bool = False
+    url: str,
+    title: str,
+    body_text: str,
+    *,
+    has_challenge_frame: bool = False,
+    has_site_form: bool = False,
 ) -> bool:
-    """Recognize Cloudflare/Turnstile pages that require a person to continue."""
-    if has_challenge_frame:
-        return True
-    haystack = " ".join((url, title, body_text)).lower()
-    title_text = title.strip().lower()
+    """Recognize Cloudflare/Turnstile pages that require a person to continue.
+
+    ``has_site_form`` advertises that a first-party login or register form is
+    present on the main document. When that is true and the page is not one of
+    the hard interstitial markers, the page is treated as site-ready even if a
+    leftover Turnstile widget is still on the page.
+    """
+    title_text = (title or "").strip().lower()
     if title_text.startswith("just a moment"):
+        return True
+    haystack = " ".join((url or "", title or "", body_text or "")).lower()
+    if "cdn-cgi/challenge-platform" in haystack:
+        return True
+    if has_site_form:
+        # Login or register form is on the page; a leftover Turnstile widget
+        # beside it should not freeze the automation loop.
+        return False
+    if has_challenge_frame:
         return True
     markers = (
         "performing security verification",
@@ -130,6 +240,38 @@ def is_human_verification_content(
         "cdn-cgi/challenge-platform",
     )
     return any(marker in haystack for marker in markers)
+
+
+def fetch_debugger_tabs(port: int, *, timeout: float = 0.5) -> list[dict[str, str]]:
+    """Return ``{"title", "url"}`` metadata for every page-type DevTools tab."""
+    last_error: Exception | None = None
+    for path in ("/json", "/json/list"):
+        url = f"http://127.0.0.1:{port}{path}"
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                payload = response.read().decode("utf-8", errors="replace")
+            data = json.loads(payload)
+        except (URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+            last_error = exc
+            continue
+        if not isinstance(data, list):
+            return []
+        tabs: list[dict[str, str]] = []
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") != "page":
+                continue
+            tabs.append(
+                {
+                    "title": str(entry.get("title") or ""),
+                    "url": str(entry.get("url") or ""),
+                }
+            )
+        return tabs
+    if last_error is not None:
+        return []
+    return []
 
 
 def is_main_site_authenticated(
@@ -144,11 +286,141 @@ def is_main_site_authenticated(
     return not has_login_form
 
 
+def _list_system_browser_processes() -> list[dict[str, str]]:
+    """Return read-only info about running brave.exe / chrome.exe processes.
+
+    Each entry is ``{"name", "pid", "command_line"}``. Helper processes
+    (``--type=crashpad-handler``, ``--type=renderer``, etc.) are included so
+    callers can see the full picture. This deliberately does **not** kill
+    anything; it is a probe used to detect a user-launched Brave/Chrome
+    sitting on the real User Data without ``--remote-debugging-port``.
+    """
+    if os.name != "nt":
+        return []
+    # Filter in WQL itself: enumerating every Win32_Process stalls for many
+    # seconds on some machines. Output shape stays Name/ProcessId/CommandLine.
+    script = (
+        "Get-CimInstance Win32_Process -Filter "
+        "\"Name = 'brave.exe' OR Name = 'chrome.exe'\" | "
+        "Select-Object Name, ProcessId, CommandLine | "
+        "ConvertTo-Json -Compress -Depth 1"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    payload = (result.stdout or "").strip()
+    if not payload:
+        return []
+    try:
+        parsed = json.loads(payload)
+    except ValueError:
+        return []
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return []
+    rows: list[dict[str, str]] = []
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        rows.append(
+            {
+                "name": str(entry.get("Name") or ""),
+                "pid": str(entry.get("ProcessId") or ""),
+                "command_line": str(entry.get("CommandLine") or ""),
+            }
+        )
+    return rows
+
+
+def find_system_browser_on_user_data(user_data_dir: Path) -> list[dict[str, str]]:
+    """Return info about system brave.exe/chrome.exe processes that conflict.
+
+    A process counts as "system" — i.e. blocks the app from launching its
+    own named-profile window — when **all** of these are true:
+
+    * it is a **main** process (the command line does **not** contain
+      ``--type=`` so renderers, GPU helpers, crashpad-handler etc. are
+      ignored),
+    * its binary name is ``brave.exe`` or ``chrome.exe`` matching the
+      selected browser, inferred from ``user_data_dir`` (Brave paths
+      match ``brave.exe``; Chrome paths match ``chrome.exe``),
+    * it is **not** a TemporaryEmailPickup-managed launch
+      (``TemporaryEmailPickup`` is absent from the command line), and
+    * it does **not** include ``--remote-debugging-port`` (so the app
+      cannot attach a ChromeDriver to it).
+
+    The command line does **not** have to contain ``--user-data-dir`` —
+    a Brave started from the taskbar / "Who's using Brave?" picker
+    typically omits that flag and still owns the real User Data. The
+    caller is expected to refuse the launch and tell the user to fully
+    quit the existing browser first. This helper is read-only.
+    """
+    target = str(user_data_dir).lower()
+    if "brave" in target:
+        target_name = "brave.exe"
+    elif "chrome" in target:
+        target_name = "chrome.exe"
+    else:
+        # Unknown User Data root; fall back to either Chromium browser so
+        # tests and unusual paths still see both kinds of conflicts.
+        target_name = ""
+    rows = _list_system_browser_processes()
+    matches: list[dict[str, str]] = []
+    for row in rows:
+        command = row.get("command_line", "")
+        if not command:
+            continue
+        if "--type=" in command:
+            continue
+        name = (row.get("name") or "").lower()
+        if target_name:
+            if name != target_name:
+                continue
+        else:
+            if name not in {"brave.exe", "chrome.exe"}:
+                continue
+        if "TemporaryEmailPickup" in command:
+            continue
+        if "--remote-debugging-port" in command:
+            continue
+        matches.append(row)
+    return matches
+
+
+SYSTEM_BROWSER_PORT_REQUIRED_MESSAGE = (
+    "检测到 Brave 已在运行。请先在任务栏完全退出 Brave，再由本程序点击"
+    "“手动打开”或“自动打开”。直接点图标打开的 Brave 没有调试端口，"
+    "程序无法接入「CF」配置，且会落到空白隔离配置从而循环人机验证。"
+)
+
+
 def terminate_stale_profile_browser(profile_path: Path, browser_path: Path) -> bool:
-    """Close only browser processes that use this app-owned profile on Windows."""
+    """Close only browser processes that use this app-owned profile on Windows.
+
+    Refuses to touch paths that do not live under the app's
+    ``TemporaryEmailPickup`` directory: the real Brave/Chrome User Data
+    is the user's daily browser, and the app must never reach into it.
+    Returns ``False`` immediately in that case without spawning any
+    PowerShell process.
+    """
     if os.name != "nt":
         return False
-    profile = str(profile_path.resolve())
+    try:
+        resolved = str(Path(profile_path).resolve())
+    except OSError:
+        resolved = str(profile_path)
+    if "TemporaryEmailPickup" not in resolved:
+        return False
+    profile = resolved
     env = os.environ.copy()
     env["TEMP_EMAIL_PROFILE_TO_CLOSE"] = profile
     env["TEMP_EMAIL_BROWSER_PROCESS"] = browser_path.name
@@ -252,6 +524,384 @@ def extract_points(values: list[str]) -> int | None:
     return None
 
 
+# --- Raw-CDP Studio login (无痕 自动打开; no ChromeDriver anywhere) ---------
+
+STUDIO_CDP_SUCCESS = "success"
+STUDIO_CDP_CAPTCHA_PENDING = "captcha_pending"
+STUDIO_CDP_FAILED = "failed"
+
+#: Normal submit wait, mirroring ``_ensure_studio_login``'s 180 s poll.
+STUDIO_LOGIN_POLL_SECONDS = 180
+#: How long to wait for the points chip to paint after a successful login.
+STUDIO_POINTS_WAIT_SECONDS = 25
+#: Login dialog open / register-toggle re-query waits.
+STUDIO_DIALOG_WAIT_SECONDS = 15
+STUDIO_TOGGLE_DIALOG_WAIT_SECONDS = 10
+
+_STUDIO_HEADER_LOGIN_SELECTOR = (
+    "header button, header a, button[aria-label], a[aria-label]"
+)
+_STUDIO_DIALOG_SELECTOR = "[role='dialog']"
+_STUDIO_DIALOG_CONTROL_SELECTOR = "button, a, span"
+_STUDIO_DIALOG_ERROR_SELECTOR = (
+    "[role='dialog'] [role='alert'], [role='dialog'] .text-red-500"
+)
+#: Main-document captcha markers only — challenge iframes are never queried.
+_STUDIO_CAPTCHA_IFRAME_SELECTOR = (
+    "iframe[src*='recaptcha'], iframe[title*='challenge']"
+)
+_STUDIO_POINTS_SELECTOR = (
+    "header button, header a, [aria-label*='coin' i], "
+    "[title*='coin' i], [data-testid*='coin' i], [class*='coin' i]"
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+@dataclass(frozen=True)
+class StudioCDPResult:
+    """Outcome of the raw-CDP Studio login."""
+
+    status: str
+    points: int | None = None
+    detail: str | None = None
+
+
+def _cdp_plain_text(markup: str) -> str:
+    """Return the human-readable text of a small outerHTML fragment."""
+    if not markup:
+        return ""
+    return " ".join(html.unescape(_HTML_TAG_RE.sub(" ", markup)).split())
+
+
+def _cdp_control_label(client: CDPClient, node_id: int) -> str:
+    """Combine a node's text, aria-label and title, like ``_studio_login_control``."""
+    attrs = client.attributes(node_id)
+    parts = (
+        _cdp_plain_text(client.outer_html(node_id)),
+        attrs.get("aria-label", ""),
+        attrs.get("title", ""),
+    )
+    return " ".join(part for part in parts if part).strip().lower()
+
+
+def _cdp_label_means_login(label: str) -> bool:
+    compact = label.replace(" ", "")
+    return (
+        "login" in compact
+        or "signin" in compact
+        or "log in" in label
+        or "sign in" in label
+    )
+
+
+def _cdp_find_login_control(client: CDPClient) -> int:
+    """Return a visible header Log in / Sign in node id, or 0."""
+    root = client.document()
+    for node_id in client.query_all(_STUDIO_HEADER_LOGIN_SELECTOR, root):
+        if client.box_model(node_id) is None:
+            continue
+        if _cdp_label_means_login(_cdp_control_label(client, node_id)):
+            return node_id
+    return 0
+
+
+def _cdp_visible_dialog(client: CDPClient) -> int:
+    dialog = client.query(_STUDIO_DIALOG_SELECTOR)
+    if dialog and client.box_model(dialog) is not None:
+        return dialog
+    return 0
+
+
+def _cdp_wait_dialog(client: CDPClient, timeout: float) -> int:
+    deadline = time.monotonic() + timeout
+    while True:
+        dialog = _cdp_visible_dialog(client)
+        if dialog:
+            return dialog
+        if time.monotonic() >= deadline:
+            return 0
+        time.sleep(0.25)
+
+
+def _cdp_find_text_control(
+    client: CDPClient, scope_id: int, texts: tuple[str, ...]
+) -> int:
+    """Return a visible button/link/span in ``scope_id`` whose text matches."""
+    wanted = {text.strip().upper() for text in texts}
+    for node_id in client.query_all(_STUDIO_DIALOG_CONTROL_SELECTOR, scope_id):
+        if client.box_model(node_id) is None:
+            continue
+        label = _cdp_plain_text(client.outer_html(node_id)).strip().upper()
+        if label in wanted:
+            return node_id
+    return 0
+
+
+def _cdp_has_captcha(client: CDPClient) -> bool:
+    root = client.document()
+    return any(
+        client.box_model(node_id) is not None
+        for node_id in client.query_all(_STUDIO_CAPTCHA_IFRAME_SELECTOR, root)
+    )
+
+
+def _cdp_dialog_error(client: CDPClient) -> str:
+    root = client.document()
+    for node_id in client.query_all(_STUDIO_DIALOG_ERROR_SELECTOR, root):
+        if client.box_model(node_id) is None:
+            continue
+        text = _cdp_plain_text(client.outer_html(node_id)).strip()
+        if text:
+            return text
+    return ""
+
+
+def _cdp_read_points(client: CDPClient) -> int | None:
+    root = client.document()
+    candidates: list[str] = []
+    for node_id in client.query_all(_STUDIO_POINTS_SELECTOR, root)[:80]:
+        attrs = client.attributes(node_id)
+        text = _cdp_plain_text(client.outer_html(node_id))
+        combined = " ".join(
+            part.strip()
+            for part in (
+                text,
+                attrs.get("aria-label", ""),
+                attrs.get("title", ""),
+                attrs.get("data-testid", ""),
+            )
+            if part and part.strip()
+        )
+        if combined:
+            candidates.append(combined)
+    return extract_points(candidates)
+
+
+def _cdp_wait_studio_tab(
+    address: str,
+    *,
+    status: StatusCallback,
+    background: bool,
+    browser_name: str,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Wait for a non-blocking Studio page target.
+
+    Returns ``(target, captcha_pending)``. A blocking "Just a moment"
+    interstitial aborts a background run immediately (pending); a foreground
+    run waits the same 10-minute human-verification budget the Selenium flow
+    uses.
+    """
+    deadline = time.monotonic() + HUMAN_VERIFICATION_TIMEOUT_SECONDS
+    announced = False
+    while True:
+        target = find_page_target(address, "studio.creativefabrica.com")
+        if target is not None:
+            blocking = is_human_verification_content(
+                str(target.get("url") or ""),
+                str(target.get("title") or ""),
+                "",
+            )
+            if not blocking:
+                return target, False
+            if not announced:
+                status(
+                    f"检测到 Studio AI 人机验证，请在 {browser_name} 窗口中手动完成；"
+                    "完成后程序会自动继续"
+                )
+                announced = True
+            if background:
+                return None, True
+        if time.monotonic() >= deadline:
+            return None, False
+        time.sleep(0.5)
+
+
+def studio_login_via_cdp(
+    debugger_address: str,
+    *,
+    email: str,
+    status: StatusCallback,
+    background: bool = False,
+    browser_name: str = "Brave",
+) -> StudioCDPResult:
+    """Open / attach the Studio tab over raw CDP and log in, without ChromeDriver.
+
+    Mirrors ``CreativeFabricaBrowser._ensure_studio_login`` but every action
+    is a ``DOM`` / ``Input`` CDP command: trusted clicks and typing, no
+    ``Runtime.enable`` and no ``Runtime.evaluate``. The browser window is
+    left open on every non-success outcome.
+    """
+    target, pending = _cdp_wait_studio_tab(
+        debugger_address,
+        status=status,
+        background=background,
+        browser_name=browser_name,
+    )
+    if target is None:
+        if pending:
+            return StudioCDPResult(STUDIO_CDP_CAPTCHA_PENDING)
+        status(
+            "等待 Studio AI 页面加载超时；浏览器窗口已保留，"
+            "完成后请再次点击“自动打开”。"
+        )
+        return StudioCDPResult(STUDIO_CDP_FAILED, detail="Studio 页面加载超时")
+    ws_url = target.get("webSocketDebuggerUrl")
+    if not ws_url:
+        return StudioCDPResult(
+            STUDIO_CDP_FAILED, detail="浏览器调试连接缺少 WebSocket 地址"
+        )
+    try:
+        with CDPClient(str(ws_url)) as client:
+            return _cdp_studio_login(
+                client,
+                email=email,
+                status=status,
+                background=background,
+                browser_name=browser_name,
+            )
+    except CDPError as exc:
+        return StudioCDPResult(STUDIO_CDP_FAILED, detail=str(exc))
+
+
+def _cdp_studio_login(
+    client: CDPClient,
+    *,
+    email: str,
+    status: StatusCallback,
+    background: bool,
+    browser_name: str,
+) -> StudioCDPResult:
+    # Wait for a Log in control or for positive logged-in evidence (points).
+    ready_deadline = time.monotonic() + PAGE_READY_TIMEOUT_SECONDS
+    while True:
+        control = _cdp_find_login_control(client)
+        if control:
+            break
+        points = _cdp_read_points(client)
+        if points is not None:
+            status(f"{email} 已保持登录，正在进入 Studio AI…")
+            status(f"{email} 当前积分：{points:,}")
+            return StudioCDPResult(STUDIO_CDP_SUCCESS, points=points)
+        if time.monotonic() >= ready_deadline:
+            # No header Log in control — treat the session as already signed
+            # in and try to read points, instead of touching the www login.
+            points = _cdp_read_points(client)
+            return StudioCDPResult(STUDIO_CDP_SUCCESS, points=points)
+        time.sleep(0.25)
+
+    status("正在同步 Creative Fabrica 登录状态到 Studio AI…")
+    if not client.click_node(control):
+        return StudioCDPResult(
+            STUDIO_CDP_FAILED, detail="Studio 登录按钮不可点击，窗口已保留"
+        )
+    dialog = _cdp_wait_dialog(client, STUDIO_DIALOG_WAIT_SECONDS)
+    if not dialog:
+        return StudioCDPResult(
+            STUDIO_CDP_FAILED, detail="Studio 登录窗口未打开，窗口已保留"
+        )
+
+    if _cdp_find_text_control(client, dialog, ("REGISTER FOR FREE",)):
+        toggle = _cdp_find_text_control(client, dialog, ("Log in",))
+        if not toggle:
+            return StudioCDPResult(
+                STUDIO_CDP_FAILED, detail="未找到登录/注册切换按钮，窗口已保留"
+            )
+        if not client.click_node(toggle):
+            return StudioCDPResult(
+                STUDIO_CDP_FAILED, detail="登录切换按钮不可点击，窗口已保留"
+            )
+        dialog = _cdp_wait_dialog(client, STUDIO_TOGGLE_DIALOG_WAIT_SECONDS)
+        if not dialog:
+            return StudioCDPResult(
+                STUDIO_CDP_FAILED, detail="Studio 登录窗口未打开，窗口已保留"
+            )
+
+    email_node = client.query("input[name='email']", dialog) or client.query(
+        "input[name='email']"
+    )
+    password_node = client.query("input[name='password']", dialog) or client.query(
+        "input[name='password']"
+    )
+    if not email_node or not password_node:
+        return StudioCDPResult(
+            STUDIO_CDP_FAILED, detail="未找到 Studio 登录表单，窗口已保留"
+        )
+    client.fill_text(email_node, email)
+    client.fill_text(password_node, email)
+
+    submit = 0
+    for node_id in client.query_all("button[type='submit']", dialog):
+        if client.box_model(node_id) is None:
+            continue
+        if _cdp_plain_text(client.outer_html(node_id)).strip().upper() == "LOG IN":
+            submit = node_id
+            break
+    if not submit:
+        return StudioCDPResult(
+            STUDIO_CDP_FAILED, detail="未找到 LOG IN 提交按钮，窗口已保留"
+        )
+    if not client.click_node(submit):
+        return StudioCDPResult(
+            STUDIO_CDP_FAILED, detail="LOG IN 按钮不可点击，窗口已保留"
+        )
+
+    deadline = time.monotonic() + STUDIO_LOGIN_POLL_SECONDS
+    captcha_deadline = time.monotonic() + HUMAN_VERIFICATION_TIMEOUT_SECONDS
+    announced_captcha = False
+    while time.monotonic() < (
+        captcha_deadline if announced_captcha else deadline
+    ):
+        visible_login = _cdp_find_login_control(client) != 0
+        visible_dialog = _cdp_visible_dialog(client) != 0
+        if not visible_login and not visible_dialog:
+            if announced_captcha:
+                status("Studio AI 人机验证已完成，继续读取积分…")
+            points = _cdp_wait_points(client, email, status)
+            return StudioCDPResult(STUDIO_CDP_SUCCESS, points=points)
+        if _cdp_has_captcha(client):
+            if not announced_captcha:
+                status(
+                    f"Studio AI 登录需要 CAPTCHA，请在 {browser_name} 中完成"
+                )
+                announced_captcha = True
+                if background:
+                    return StudioCDPResult(STUDIO_CDP_CAPTCHA_PENDING)
+        else:
+            error_text = _cdp_dialog_error(client)
+            if error_text:
+                status(f"Studio AI 登录失败：{error_text}；浏览器窗口已保留")
+                return StudioCDPResult(STUDIO_CDP_FAILED, detail=error_text)
+        time.sleep(1)
+
+    if announced_captcha:
+        # Kept the window the whole foreground wait; finishing here must look
+        # like the manual-follow-up state, never like a ChromeDriver fallback.
+        status(
+            f"Studio AI 人机验证仍在进行；请在 {browser_name} 窗口完成后再次点击"
+            "“自动打开”"
+        )
+        return StudioCDPResult(STUDIO_CDP_CAPTCHA_PENDING)
+    return StudioCDPResult(
+        STUDIO_CDP_FAILED, detail="Studio AI 登录等待超时，窗口已保留"
+    )
+
+
+def _cdp_wait_points(
+    client: CDPClient, email: str, status: StatusCallback
+) -> int | None:
+    status("正在读取 Studio AI 积分…")
+    deadline = time.monotonic() + STUDIO_POINTS_WAIT_SECONDS
+    while True:
+        points = _cdp_read_points(client)
+        if points is not None:
+            status(f"{email} 当前积分：{points:,}")
+            return points
+        if time.monotonic() >= deadline:
+            status("Studio AI 已登录，但任务栏中暂未识别到积分")
+            return None
+        time.sleep(1)
+
+
 class CreativeFabricaBrowser:
     """Drive one Chromium window while keeping the browser profile independent."""
 
@@ -294,19 +944,31 @@ class CreativeFabricaBrowser:
         self.human_verification_pending = False
 
     def run(self):
-        """Open the selected browser, try login, then register when needed."""
+        """Open the selected browser, try login, then register when needed.
+
+        The session now starts on ``studio.creativefabrica.com`` instead of
+        the main www site, because Cloudflare's "Just a moment…"
+        interstitial blocks the www login/register flow. Only when Studio
+        rejects the login (Cloudflare, dialog error, background CAPTCHA
+        abort) do we fall back to ``_navigate(LOGIN_URL)`` +
+        ``_continue_login_flow`` for the legacy www register / OTP path.
+        """
         webdriver, By, WebDriverWait = self._selenium_imports()
         if self.driver is not None:
-            self._navigate(LOGIN_URL, By)
+            if self._begin_studio_session(By, WebDriverWait):
+                return self.driver
             if self.reset_site_session:
                 self._logout_before_reassignment(By)
+            self._navigate(LOGIN_URL, By)
             return self._continue_login_flow(By, WebDriverWait)
         if self.debugger_address:
             self.status(f"正在连接 {self.address} 的 {self.browser_name} 指纹配置…")
             self.driver = self._attach_to_debugger(webdriver)
-            self._navigate(LOGIN_URL, By)
+            if self._begin_studio_session(By, WebDriverWait):
+                return self.driver
             if self.reset_site_session:
                 self._logout_before_reassignment(By)
+            self._navigate(LOGIN_URL, By)
             return self._continue_login_flow(By, WebDriverWait)
 
         if self.profile_path is None or self.browser_path is None:
@@ -322,10 +984,11 @@ class CreativeFabricaBrowser:
             )
         self.driver = None
         if debugger_address and debugger_live:
-            attach_options = self._browser_options(webdriver)
-            attach_options.add_experimental_option(
-                "debuggerAddress", debugger_address
-            )
+            # A live manual window is already on the profile. Try to attach
+            # to it. On failure we must NOT terminate it (the user has the
+            # Cloudflare clearance there) and must NOT relaunch a new browser
+            # (that would throw away the clearance and the cookies).
+            attach_options = self._attach_options(webdriver, debugger_address)
             self.status(f"正在连接 {self.address} 已打开的 {self.browser_name}…")
             try:
                 self.driver = webdriver.Chrome(options=attach_options)
@@ -333,10 +996,21 @@ class CreativeFabricaBrowser:
                 # disappears during attachment. Force a real round trip now.
                 if not self.driver.window_handles:
                     raise RuntimeError(f"{self.browser_name} 没有可用窗口")
-            except Exception:
+            except Exception as exc:
                 self.driver = None
-        if self.driver is None:
-            if terminate_stale_profile_browser(self.profile_path, self.browser_path):
+                if browser_was_closed(exc):
+                    raise
+                raise RuntimeError(
+                    f"{self.browser_name} 手动窗口已打开但无法连接；"
+                    "请保持窗口打开，再次点击“自动打开”重试。"
+                ) from exc
+        elif debugger_address:
+            # Stale DevToolsActivePort left by a previous session. Clean up
+            # the orphaned process and relaunch a fresh browser so this run
+            # can proceed.
+            if terminate_stale_profile_browser(
+                self.profile_path, self.browser_path
+            ):
                 self.status(
                     f"{self.address} 的旧 {self.browser_name} 调试连接已失效，正在恢复窗口…"
                 )
@@ -350,10 +1024,100 @@ class CreativeFabricaBrowser:
             else:
                 self.status(f"正在启动 {self.address} 的 {self.browser_name}…")
             self.driver = webdriver.Chrome(options=options)
-        self._navigate(LOGIN_URL, By)
+        else:
+            options = self._browser_options(webdriver)
+            options.add_argument(f"--user-data-dir={self.profile_path}")
+            options.add_argument("--no-first-run")
+            options.add_argument("--no-default-browser-check")
+            self._configure_window_options(options)
+            if self.background:
+                self.status(f"正在后台处理 {self.address} 的登录/注册…")
+            else:
+                self.status(f"正在启动 {self.address} 的 {self.browser_name}…")
+            self.driver = webdriver.Chrome(options=options)
+        if self._begin_studio_session(By, WebDriverWait):
+            return self.driver
         if self.reset_site_session:
             self._logout_before_reassignment(By)
+        self._navigate(LOGIN_URL, By)
         return self._continue_login_flow(By, WebDriverWait)
+
+    def _begin_studio_session(self, By, WebDriverWait) -> bool:
+        """Start the session on Studio instead of the Cloudflare-blocked www site.
+
+        Navigates to ``STUDIO_URL`` and runs the Studio-side login. On
+        success ``authenticated()`` and ``_update_points`` are called and
+        the caller MUST NOT open ``LOGIN_URL`` or call
+        ``_continue_login_flow``. On failure the caller should fall back
+        to ``_navigate(LOGIN_URL)`` + ``_continue_login_flow`` so the
+        legacy www register / OTP path still works.
+        """
+        self._adopt_studio_tab()
+        self._navigate(STUDIO_URL, By)
+        if not self._ensure_studio_login(By, WebDriverWait):
+            return False
+        self.authenticated()
+        self._update_points(By, WebDriverWait)
+        return True
+
+    def _adopt_studio_tab(self) -> None:
+        """Keep one Studio tab; close restored www.creativefabrica.com extras.
+
+        Named Brave profiles restore the last session, so ``--new-window``
+        plus ``STUDIO_URL`` often leaves a leftover www tab beside Studio.
+        Login and points only run on the current handle, so extras stay
+        logged out and look like a second homepage.
+        """
+        try:
+            handles = list(self.driver.window_handles)
+        except Exception:
+            return
+        if not handles:
+            return
+
+        studio_handles: list[str] = []
+        www_handles: list[str] = []
+        current = None
+        try:
+            current = self.driver.current_window_handle
+        except Exception:
+            current = None
+
+        for handle in handles:
+            try:
+                self.driver.switch_to.window(handle)
+                url = (self.driver.current_url or "").lower()
+            except Exception:
+                continue
+            if "studio.creativefabrica.com" in url:
+                studio_handles.append(handle)
+            elif "www.creativefabrica.com" in url:
+                www_handles.append(handle)
+
+        keep = studio_handles[0] if studio_handles else current or handles[0]
+        extras = [
+            handle
+            for handle in (*www_handles, *studio_handles[1:])
+            if handle != keep
+        ]
+        for handle in extras:
+            try:
+                self.driver.switch_to.window(handle)
+                self.driver.close()
+            except Exception:
+                continue
+        try:
+            self.driver.switch_to.window(keep)
+        except Exception:
+            try:
+                remaining = list(self.driver.window_handles)
+            except Exception:
+                return
+            if remaining:
+                try:
+                    self.driver.switch_to.window(remaining[0])
+                except Exception:
+                    return
 
     def _configure_window_options(self, options: Any) -> None:
         """Show automated browser windows while detaching only interactive flows."""
@@ -615,12 +1379,22 @@ class CreativeFabricaBrowser:
             self.status(f"验证码已填写并提交，请在 {self.browser_name} 窗口确认结果")
         return self.driver
 
-    def _attach_to_debugger(self, webdriver):
-        """Attach ChromeDriver to a browser process launched by Donut."""
-        options = self._browser_options(webdriver)
-        options.add_experimental_option("debuggerAddress", self.debugger_address)
+    def _attach_options(self, webdriver, debugger_address: str):
+        """ChromeOptions for connecting to an already-running Chromium.
+
+        ChromeDriver rejects launch-only keys such as ``excludeSwitches``
+        when ``debuggerAddress`` is set (``unrecognized chrome option``).
+        Keep this object to debugger address + optional browser version.
+        """
+        options = webdriver.ChromeOptions()
+        options.add_experimental_option("debuggerAddress", debugger_address)
         if self.browser_version:
             options.browser_version = self.browser_version
+        return options
+
+    def _attach_to_debugger(self, webdriver):
+        """Attach ChromeDriver to a browser process launched by Donut."""
+        options = self._attach_options(webdriver, self.debugger_address or "")
         driver = webdriver.Chrome(options=options)
         if not driver.window_handles:
             raise RuntimeError(f"{self.browser_name} 没有可用窗口")
@@ -637,7 +1411,9 @@ class CreativeFabricaBrowser:
         """Open Studio and replace the fallback balance with the visible value."""
         try:
             self.status("正在读取 Studio AI 积分…")
-            self.driver.get(STUDIO_URL)
+            # Prefer ``_navigate`` over ``driver.get`` so we don't re-trigger
+            # Cloudflare when the page is already on Studio.
+            self._navigate(STUDIO_URL, By)
             WebDriverWait(self.driver, 25).until(
                 lambda driver: driver.execute_script("return document.readyState")
                 in {"interactive", "complete"}
@@ -666,15 +1442,18 @@ class CreativeFabricaBrowser:
             self.status(f"登录成功，积分更新失败：{exc}")
 
     def _ensure_studio_login(self, By, WebDriverWait) -> bool:
-        """Log into Studio's own account dialog when SSO has not propagated."""
-        login_buttons = self.driver.find_elements(
-            By.XPATH,
-            "//header//button[normalize-space()='Log in'] | "
-            "//button[@aria-label='Log in']",
-        )
-        login_button = next((item for item in login_buttons if item.is_displayed()), None)
+        """Log into Studio's own account dialog when SSO has not propagated.
+
+        Waits for any Cloudflare challenge on Studio to clear (reusing the
+        10-minute human-verification wait) before checking the header
+        "Log in" button. Studio never exposes a WooCommerce login form, so
+        we deliberately do **not** wait for ``main form.woocommerce-form-login``.
+        """
+        if not self._wait_for_studio_ready(By, WebDriverWait):
+            return False
+        login_button = self._wait_for_studio_login_control(By)
         if login_button is None:
-            return True
+            return self._studio_logged_in_evidence(By)
 
         self.status("正在同步 Creative Fabrica 登录状态到 Studio AI…")
         login_button.click()
@@ -718,14 +1497,7 @@ class CreativeFabricaBrowser:
         deadline = time.monotonic() + 180
         announced_captcha = False
         while time.monotonic() < deadline:
-            visible_login = any(
-                item.is_displayed()
-                for item in self.driver.find_elements(
-                    By.XPATH,
-                    "//header//button[normalize-space()='Log in'] | "
-                    "//button[@aria-label='Log in']",
-                )
-            )
+            visible_login = self._studio_login_control(By) is not None
             visible_dialog = any(
                 item.is_displayed()
                 for item in self.driver.find_elements(By.CSS_SELECTOR, "[role='dialog']")
@@ -753,6 +1525,93 @@ class CreativeFabricaBrowser:
                 return False
             time.sleep(1)
         return False
+
+    def _wait_for_studio_login_control(self, By):
+        """Wait briefly for a Studio Log in control to paint."""
+        deadline = time.monotonic() + PAGE_READY_TIMEOUT_SECONDS
+        while True:
+            control = self._studio_login_control(By)
+            if control is not None:
+                return control
+            if self._studio_logged_in_evidence(By):
+                return None
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.25)
+
+    def _studio_login_control(self, By):
+        """Return a visible Log in / Sign in control, or None."""
+        try:
+            candidates = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "header button, header a, button[aria-label], a[aria-label]",
+            )
+        except Exception:
+            candidates = []
+        for item in candidates:
+            try:
+                if hasattr(item, "is_displayed") and not item.is_displayed():
+                    continue
+                label = " ".join(
+                    part
+                    for part in (
+                        getattr(item, "text", None),
+                        item.get_attribute("aria-label") if hasattr(item, "get_attribute") else "",
+                        item.get_attribute("title") if hasattr(item, "get_attribute") else "",
+                    )
+                    if part
+                ).strip().lower()
+            except Exception:
+                continue
+            compact = label.replace(" ", "")
+            if (
+                "login" in compact
+                or "signin" in compact
+                or "log in" in label
+                or "sign in" in label
+            ):
+                return item
+        return None
+
+    def _studio_logged_in_evidence(self, By) -> bool:
+        """True only with positive logged-in evidence, not 'no Log in button'."""
+        try:
+            return self._read_studio_points(By) is not None
+        except Exception:
+            return False
+
+    def _wait_for_studio_ready(self, By, WebDriverWait) -> bool:
+        """Wait until Studio stops showing a blocking Cloudflare challenge.
+
+        Reuses the 10-minute human-verification wait used by the www flow.
+        Returns True once the page is no longer an interstitial, False when
+        the wait timed out (background workers) or the user closed the
+        browser.
+        """
+        deadline = time.monotonic() + HUMAN_VERIFICATION_TIMEOUT_SECONDS
+        announced = False
+        while True:
+            if self._has_human_verification(By):
+                self.human_verification_pending = True
+                if not announced:
+                    self.status(
+                        f"检测到 Studio AI 人机验证，请在 {self.browser_name} 窗口中手动完成；"
+                        "完成后程序会自动继续"
+                    )
+                    announced = True
+                if self.background:
+                    return False
+                if time.monotonic() >= deadline:
+                    self.status(
+                        "等待 Studio AI 人机验证超时；浏览器窗口已保留，完成后请再次点击"
+                    )
+                    return False
+                time.sleep(0.5)
+                continue
+            if announced:
+                self.human_verification_pending = False
+                self.status("Studio AI 人机验证已完成，继续检查登录状态…")
+            return True
 
     def _read_studio_points(self, By) -> int | None:
         candidates: list[str] = []
@@ -822,7 +1681,22 @@ class CreativeFabricaBrowser:
         )
 
     def _has_human_verification(self, By) -> bool:
-        """Return whether the current page is a Cloudflare/Turnstile challenge."""
+        """Return whether the current page is a Cloudflare/Turnstile challenge.
+
+        Polling rules:
+
+        * Read ``current_url`` and ``title`` first; either is enough to flag
+          the known interstitial markers.
+        * Detect first-party site forms with selectors already used by the
+          flow. Their presence means the page is site-ready even if a leftover
+          Turnstile widget still sits on the form.
+        * Only inspect **main-document** challenge markers
+          (``#challenge-running``, ``#challenge-stage``) when computing
+          ``has_challenge_frame``. Walking challenge iframes resets the
+          Turnstile widget and is forbidden.
+        * Read ``body.text`` only as a last resort; never walk challenge
+          iframes to gather text.
+        """
         try:
             url = self.driver.current_url or ""
         except Exception:
@@ -831,33 +1705,85 @@ class CreativeFabricaBrowser:
             title = self.driver.title or ""
         except Exception:
             title = ""
+
+        title_text = (title or "").strip().lower()
+        if title_text.startswith("just a moment"):
+            return True
+        if "cdn-cgi/challenge-platform" in (url or "").lower():
+            return True
+
         try:
-            bodies = self.driver.find_elements(By.TAG_NAME, "body")
-            body_text = bodies[0].text if bodies else ""
+            login_forms = self.driver.find_elements(
+                By.CSS_SELECTOR, LOGIN_FORM_SELECTOR
+            )
         except Exception:
-            body_text = ""
+            login_forms = []
+        try:
+            register_forms = self.driver.find_elements(
+                By.CSS_SELECTOR, REGISTER_FORM_SELECTOR
+            )
+        except Exception:
+            register_forms = []
+        has_site_form = bool(login_forms) or bool(register_forms)
+
         try:
             challenge_elements = self.driver.find_elements(
-                By.CSS_SELECTOR,
-                "iframe[src*='challenges.cloudflare.com'], "
-                "iframe[src*='recaptcha'], iframe[title*='challenge' i], "
-                ".cf-turnstile, [class*='cf-turnstile'], "
-                "#challenge-running, #challenge-stage",
-            )
-            has_challenge_frame = any(
-                item.is_displayed() for item in challenge_elements
+                By.CSS_SELECTOR, "#challenge-running, #challenge-stage"
             )
         except Exception:
-            has_challenge_frame = False
+            challenge_elements = []
+        has_challenge_frame = bool(challenge_elements)
+
+        if has_site_form or has_challenge_frame:
+            return is_human_verification_content(
+                url,
+                title,
+                "",
+                has_challenge_frame=has_challenge_frame,
+                has_site_form=has_site_form,
+            )
+
+        # Inconclusive from title/url/form/stage; read the main-document body
+        # text only.
+        try:
+            bodies = self.driver.find_elements(By.TAG_NAME, "body")
+        except Exception:
+            bodies = []
+        body_text = ""
+        if bodies:
+            try:
+                body_text = bodies[0].text or ""
+            except Exception:
+                body_text = ""
         return is_human_verification_content(
             url,
             title,
             body_text,
-            has_challenge_frame=has_challenge_frame,
+            has_challenge_frame=False,
+            has_site_form=False,
         )
 
     def _navigate(self, url: str, By) -> None:
-        """Navigate without failing when ChromeDriver races a visible challenge page."""
+        """Navigate without failing when ChromeDriver races a visible challenge page.
+
+        When the current page is already the requested URL (trailing slash and
+        case ignored) and the user is not staring at a blocking interstitial,
+        do not reload. Reloading ``/login/`` right after the user just passed
+        Cloudflare often triggers a brand-new challenge.
+        """
+        target_normalized = self._normalize_url(url)
+        try:
+            current_url = self.driver.current_url or ""
+        except Exception:
+            current_url = ""
+        if target_normalized and self._normalize_url(current_url) == target_normalized:
+            if not self._has_human_verification(By):
+                return
+            # Same URL but a blocking interstitial is on top. Treat this as
+            # the wait loop's responsibility rather than reloading.
+            self.human_verification_pending = True
+            return
+
         try:
             self.driver.get(url)
             return
@@ -877,6 +1803,10 @@ class CreativeFabricaBrowser:
             if time.monotonic() >= deadline:
                 raise navigation_error
             time.sleep(0.25)
+
+    @staticmethod
+    def _normalize_url(value: str) -> str:
+        return (value or "").rstrip("/").lower()
 
     @staticmethod
     def _retry_page_probe(
